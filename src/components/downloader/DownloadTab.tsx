@@ -12,12 +12,14 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Progress } from "@/components/ui/progress";
-import { Eye, Loader2, Download } from "lucide-react";
+import { Eye, Loader2, Download, X } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import VideoPreview from "./VideoPreview";
-import axios, { CancelTokenSource } from "axios";
+import axios from "axios";
 
-// Video information interface
+// ============================================
+// INTERFACES & TYPES
+// ============================================
 interface VideoInfo {
   title: string;
   thumbnail: string;
@@ -27,7 +29,6 @@ interface VideoInfo {
   description: string;
 }
 
-// Download history interface
 interface DownloadHistory {
   id: string;
   title: string;
@@ -39,81 +40,123 @@ interface DownloadHistory {
   thumbnail?: string;
 }
 
-// Download state interface for progress and loading
 interface DownloadState {
+  isDownloading: boolean;
   progress: number;
-  status: string;
-  isLoading: boolean;
+  statusMessage: string;
+  downloadId: string;
+  url: string;
+  quality: string;
+  format: string;
+  downloadType: string;
 }
 
+// ============================================
+// MAIN COMPONENT
+// ============================================
 const DownloadTab = () => {
-  // =======================
-  // Step 1: State & refs
-  // =======================
-  const [url, setUrl] = useState(""); // video URL input
-  const [format, setFormat] = useState("mp4"); // selected format
-  const [quality, setQuality] = useState("720p"); // selected quality
-  const [downloadType, setDownloadType] = useState("video"); // video/audio/thumbnail
-  const [videoInfo, setVideoInfo] = useState<VideoInfo | null>(null); // preview info
-  const [showPreview, setShowPreview] = useState(false); // toggle preview display
-  const [history, setHistory] = useState<DownloadHistory[]>([]); // download history
-  const [renderTrigger, setRenderTrigger] = useState(0); // force UI re-render
-  const { toast } = useToast(); // toast notifications
+  // ============================================
+  // STATE DECLARATIONS
+  // ============================================
+  const [url, setUrl] = useState("");
+  const [format, setFormat] = useState("mp4");
+  const [quality, setQuality] = useState("720p");
+  const [downloadType, setDownloadType] = useState("video");
+  const [videoInfo, setVideoInfo] = useState<VideoInfo | null>(null);
+  const [showPreview, setShowPreview] = useState(false);
+  const [history, setHistory] = useState<DownloadHistory[]>([]);
+  
+  // Download state
+  const [isLoading, setIsLoading] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [statusMessage, setStatusMessage] = useState("");
+  const [isDownloading, setIsDownloading] = useState(false);
+  const [downloadId, setDownloadId] = useState<string>("");
+  
+  const { toast } = useToast();
+  const wsRef = useRef<WebSocket | null>(null);
 
-  // Ref for download state to persist across renders/tab switches
-  const downloadStateRef = useRef<DownloadState>({
-    progress: 0,
-    status: "",
-    isLoading: false,
-  });
-
-  // Ref for cancelling download requests
-  const cancelTokenRef = useRef<CancelTokenSource | null>(null);
-
-  // Available formats and qualities
-  const formats = { video: ["MP4", "WEBM", "AVI", "MOV"], audio: ["MP3", "M4A", "WAV", "FLAC"] };
-  const qualities = ["4K","2K","1080p","720p","480p","360p","240p","144p"];
-
-  // Force UI re-render
-  const forceRender = () => setRenderTrigger(prev => prev + 1);
-
-  // =======================
-  // Step 3: Save current download state
-  const saveDownloadState = () => {
-    // Also save current URL so it can be restored after tab switch
-    const stateToSave = { ...downloadStateRef.current, url };
-    localStorage.setItem("downloadState", JSON.stringify(stateToSave));
-    forceRender();
+  // ============================================
+  // CONSTANTS
+  // ============================================
+  const formats = {
+    video: ["mp4", "webm", "avi", "mov"],
+    audio: ["mp3", "m4a", "wav", "flac"]
   };
+  const qualities = ["4K", "2K", "1080p", "720p", "480p", "360p", "240p", "144p"];
 
-  // Step 2: Load previous state
+  // ============================================
+  // LOAD SAVED STATE ON MOUNT
+  // ============================================
   useEffect(() => {
     try {
+      // Load history
       const savedHistory = localStorage.getItem("downloadHistory");
       if (savedHistory) setHistory(JSON.parse(savedHistory));
 
-      const savedDownload = localStorage.getItem("downloadState");
-      if (savedDownload) {
-        const parsed = JSON.parse(savedDownload);
-        downloadStateRef.current = parsed;
-        if (parsed.url) setUrl(parsed.url); // restore URL input
-        forceRender();
-      }
-
+      // Load preview state
       const savedPreview = localStorage.getItem("videoPreviewState");
       if (savedPreview) {
         const parsed = JSON.parse(savedPreview);
         setVideoInfo(parsed.videoInfo);
         setShowPreview(true);
+        setUrl(parsed.url);
       }
-    } catch {
-      localStorage.removeItem("downloadHistory"); // clear invalid storage
+
+      // Load active download state
+      const savedDownloadState = localStorage.getItem("activeDownloadState");
+      if (savedDownloadState) {
+        const downloadState: DownloadState = JSON.parse(savedDownloadState);
+        
+        // Restore download state
+        setIsDownloading(downloadState.isDownloading);
+        setProgress(downloadState.progress);
+        setStatusMessage(downloadState.statusMessage);
+        setDownloadId(downloadState.downloadId);
+        setUrl(downloadState.url);
+        setQuality(downloadState.quality);
+        setFormat(downloadState.format);
+        setDownloadType(downloadState.downloadType);
+
+        // Show notification about restored state
+        if (downloadState.isDownloading && downloadState.downloadId) {
+          toast({
+            title: "Download State Restored",
+            description: "Your previous download was in progress. You can cancel it if needed."
+          });
+        }
+      }
+    } catch (err) {
+      console.error("Error loading saved state:", err);
+      localStorage.removeItem("downloadHistory");
+      localStorage.removeItem("activeDownloadState");
     }
   }, []);
 
-  // =======================
-  // Step 4: Save new download entry to history
-  // =======================
+  // ============================================
+  // SAVE DOWNLOAD STATE ON CHANGE
+  // ============================================
+  useEffect(() => {
+    if (isDownloading) {
+      const downloadState: DownloadState = {
+        isDownloading,
+        progress,
+        statusMessage,
+        downloadId,
+        url,
+        quality,
+        format,
+        downloadType
+      };
+      localStorage.setItem("activeDownloadState", JSON.stringify(downloadState));
+    } else {
+      localStorage.removeItem("activeDownloadState");
+    }
+  }, [isDownloading, progress, statusMessage, downloadId, url, quality, format, downloadType]);
+
+  // ============================================
+  // SAVE TO HISTORY
+  // ============================================
   const saveToHistory = (filename: string) => {
     const newEntry: DownloadHistory = {
       id: Date.now().toString(),
@@ -130,15 +173,15 @@ const DownloadTab = () => {
     localStorage.setItem("downloadHistory", JSON.stringify(updated));
   };
 
-  // =======================
-  // Step 5: Fetch video info (preview)
-  // =======================
+  // ============================================
+  // FETCH VIDEO INFO
+  // ============================================
   const fetchVideoInfo = async (videoUrl: string) => {
-    downloadStateRef.current.isLoading = true; // show loading spinner
-    saveDownloadState();
-
+    setIsLoading(true);
     try {
-      const response = await axios.post("http://127.0.0.1:8000/api/video-info", { url: videoUrl });
+      const response = await axios.post("http://127.0.0.1:8000/api/video-info", {
+        url: videoUrl
+      });
       const data = response.data;
 
       const info: VideoInfo = {
@@ -151,149 +194,306 @@ const DownloadTab = () => {
       };
 
       setVideoInfo(info);
-      setShowPreview(true); // display preview component
-      localStorage.setItem("videoPreviewState", JSON.stringify({ url: videoUrl, videoInfo: info }));
-      toast({ title: "Video Info Retrieved", description: "Video details loaded successfully" });
+      setShowPreview(true);
+      localStorage.setItem("videoPreviewState", JSON.stringify({
+        url: videoUrl,
+        videoInfo: info
+      }));
+      toast({
+        title: "Video Info Retrieved",
+        description: "Video details loaded successfully"
+      });
     } catch (err: any) {
-      toast({ title: "Error", description: err.response?.data?.detail || "Failed to fetch video info", variant: "destructive" });
+      toast({
+        title: "Error",
+        description: err.response?.data?.detail || "Failed to fetch video info",
+        variant: "destructive"
+      });
     } finally {
-      downloadStateRef.current.isLoading = false;
-      saveDownloadState();
+      setIsLoading(false);
     }
   };
 
-  // =======================
-  // Step 6: Handle download with live progress & cancel
-  // =======================
+  // ============================================
+  // HANDLE DOWNLOAD
+  // ============================================
   const handleDownload = async () => {
-    if (!url) return toast({ title: "Error", description: "Please enter a video URL", variant: "destructive" });
+    if (!url) {
+      return toast({
+        title: "Error",
+        description: "Please enter a video URL",
+        variant: "destructive"
+      });
+    }
 
-    downloadStateRef.current.isLoading = true;
-    downloadStateRef.current.progress = 0;
-    downloadStateRef.current.status = "";
-    saveDownloadState();
+    const newDownloadId = `download_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    setDownloadId(newDownloadId);
+    setIsDownloading(true);
+    setProgress(0);
+    setStatusMessage("Initializing download...");
 
-    cancelTokenRef.current = axios.CancelToken.source();
+    const ws = new WebSocket(`ws://127.0.0.1:8000/ws/download/${newDownloadId}`);
+    wsRef.current = ws;
 
-    let lastTime = Date.now();
-    let lastLoaded = 0;
+    ws.onopen = () => {
+      ws.send(JSON.stringify({
+        url,
+        type: downloadType,
+        quality: downloadType === "audio" ? format : quality,
+        format: format
+      }));
+    };
 
+    ws.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+      console.log("WS DATA:", data);
+
+      if (data.status === "initializing") {
+        setStatusMessage(data.message);
+      } 
+      else if (data.status === "downloading") {
+        // ✅ backend sends float now, so no need to replace('%')
+        const percentNum = typeof data.percent === "number" ? data.percent : parseFloat(data.percent);
+        setProgress(percentNum);
+
+        const fragInfo = data.fragment_count > 0 
+          ? ` (frag ${data.fragment_index}/${data.fragment_count})`
+          : "";
+
+        setStatusMessage(
+          `[download] ${percentNum.toFixed(1)}% of ~${data.total} at ${data.speed} ETA ${data.eta}${fragInfo}`
+        );
+      } 
+      else if (data.status === "processing") {
+        setProgress(95);
+        setStatusMessage(data.message);
+      } 
+      else if (data.status === "completed") {
+        setProgress(100);
+        setStatusMessage("Download Complete!");
+        setTimeout(() => downloadFile(data.filename), 500);
+      } 
+      else if (data.status === "cancelled") {
+        setStatusMessage("Download cancelled");
+        toast({
+          title: "Download Cancelled",
+          description: "Download stopped by user"
+        });
+        resetDownloadState();
+      } 
+      else if (data.status === "error") {
+        toast({
+          title: "Download Failed",
+          description: data.message,
+          variant: "destructive"
+        });
+        resetDownloadState();
+      }
+    };
+
+    ws.onerror = () => {
+      toast({
+        title: "Connection Error",
+        description: "Failed to connect to download server",
+        variant: "destructive"
+      });
+      resetDownloadState();
+    };
+
+    ws.onclose = () => {
+      wsRef.current = null;
+    };
+  };
+
+
+  // ============================================
+  // DOWNLOAD FILE FROM SERVER
+  // ============================================
+  const sanitizeFilename = (name: string) => {
+    return name.replace(/[^a-z0-9_\-\.]/gi, "_");
+  };
+
+  const downloadFile = async (filename: string) => {
     try {
-      const response = await axios.post(
-        "http://127.0.0.1:8000/api/download",
-        { url, format, quality, type: downloadType },
-        {
-          responseType: "blob",
-          cancelToken: cancelTokenRef.current.token,
-          onDownloadProgress: (e) => {
-            if (e.total) {
-              // Update percentage
-              const percent = (e.loaded / e.total) * 100;
-              downloadStateRef.current.progress = percent;
-
-              // Calculate speed & ETA
-              const now = Date.now();
-              const deltaTime = (now - lastTime)/1000;
-              const deltaLoaded = e.loaded - lastLoaded;
-              const speed = deltaLoaded / (1024*1024) / deltaTime;
-              const remainingMiB = e.total - e.loaded;
-              const etaSec = remainingMiB / (speed*1024*1024);
-              const etaMin = Math.floor(etaSec / 60);
-              const etaSeconds = Math.floor(etaSec % 60);
-
-              // Update status
-              downloadStateRef.current.status = `[download] ${percent.toFixed(1)}% ~${(e.total/(1024*1024)).toFixed(2)}MiB at ${speed.toFixed(2)}MiB/s ETA ${etaMin.toString().padStart(2,"0")}:${etaSeconds.toString().padStart(2,"0")}`;
-
-              saveDownloadState(); // persist progress
-              lastTime = now;
-              lastLoaded = e.loaded;
-            }
-          },
-        }
+      setStatusMessage("Saving file...");
+      
+      const response = await axios.get(
+        `http://127.0.0.1:8000/downloads/${encodeURIComponent(filename)}`,
+        { responseType: 'blob' }
       );
 
-      // Create download blob
-      const blob = new Blob([response.data], { type: response.headers["content-type"] || "application/octet-stream" });
+      const blob = new Blob([response.data]);
       const downloadUrl = window.URL.createObjectURL(blob);
-
-      // Determine filename
-      let filename = "video.mp4";
-      const contentDisposition = response.headers["content-disposition"];
-      if (contentDisposition) {
-        const match = contentDisposition.match(/filename\*?=([^;]+)/);
-        if (match && match[1]) filename = decodeURIComponent(match[1].replace("utf-8''",""));
-      }
-
       const a = document.createElement("a");
       a.href = downloadUrl;
-      a.download = filename;
+      a.download = sanitizeFilename(filename); // ✅ sanitize filename
       document.body.appendChild(a);
       a.click();
       a.remove();
       window.URL.revokeObjectURL(downloadUrl);
 
-      saveToHistory(filename); // save completed download
-      downloadStateRef.current.progress = 100;
-      downloadStateRef.current.status = "Download Complete";
-      saveDownloadState();
-      toast({ title: "Download Complete", description: `Downloaded ${filename} successfully` });
-    } catch (err: any) {
-      if (axios.isCancel(err)) toast({ title: "Download Cancelled", description: "Download stopped by user" });
-      else toast({ title: "Download Failed", description: err.response?.data?.detail || "Error during download", variant: "destructive" });
-      downloadStateRef.current.status = "";
-      saveDownloadState();
-    } finally {
-      downloadStateRef.current.isLoading = false;
-      saveDownloadState();
-      cancelTokenRef.current = null;
+      saveToHistory(filename);
+      toast({
+        title: "Download Complete",
+        description: `Downloaded ${filename} successfully`
+      });
+
+      setTimeout(resetDownloadState, 2000);
+    } catch (err) {
+      toast({
+        title: "Download Failed",
+        description: "Failed to save file to device",
+        variant: "destructive"
+      });
+      resetDownloadState();
     }
   };
 
-  // =======================
-  // Step 7: Preview handler
-  // =======================
-  const handlePreview = () => {
-    if(url) fetchVideoInfo(url);
-    else toast({title:"Error", description:"Enter video URL", variant:"destructive"});
+
+  // ============================================
+  // RESET DOWNLOAD STATE
+  // ============================================
+  const resetDownloadState = () => {
+    setIsDownloading(false);
+    setProgress(0);
+    setStatusMessage("");
+    setDownloadId("");
+    localStorage.removeItem("activeDownloadState");
   };
 
-  // =======================
-  // Step 8: Clear form / cancel download
-  // =======================
+  // ============================================
+  // CANCEL DOWNLOAD
+  // ============================================
+  const handleCancel = async () => {
+    if (!downloadId) {
+      resetDownloadState();
+      return;
+    }
+
+    try {
+      // Close WebSocket first
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.close();
+        wsRef.current = null;
+      }
+
+      // Send cancellation request to backend
+      await axios.post(`http://127.0.0.1:8000/api/cancel/${downloadId}`);
+      
+      toast({
+        title: "Cancelled",
+        description: "Download cancelled successfully"
+      });
+    } catch (err) {
+      console.error("Error cancelling download:", err);
+      toast({
+        title: "Cancelled",
+        description: "Download stopped locally"
+      });
+    } finally {
+      resetDownloadState();
+    }
+  };
+
+  // ============================================
+  // PREVIEW HANDLER
+  // ============================================
+  const handlePreview = () => {
+    if (url) {
+      fetchVideoInfo(url);
+    } else {
+      toast({
+        title: "Error",
+        description: "Enter video URL",
+        variant: "destructive"
+      });
+    }
+  };
+
+  // ============================================
+  // CLEAR FORM
+  // ============================================
   const clearForm = () => {
-    if (cancelTokenRef.current) cancelTokenRef.current.cancel(); // cancel ongoing download
     setUrl("");
     setVideoInfo(null);
     setShowPreview(false);
-    downloadStateRef.current.progress = 0;
-    downloadStateRef.current.status = "";
-    downloadStateRef.current.isLoading = false;
-    saveDownloadState();
     localStorage.removeItem("videoPreviewState");
   };
 
-  // =======================
-  // Step 9: Render UI
-  // =======================
+  // ============================================
+  //   SYNC SETTINGS WITH SETTINGS TAB
+  // ============================================
+  useEffect(() => {
+    const loadSettings = () => {
+      try {
+        const saved = localStorage.getItem("userSettings");
+        if (saved) {
+          const parsed = JSON.parse(saved);
+          // ✅ Fixed key names and fallback
+          if (parsed.default_quality) setQuality(parsed.default_quality);
+          if (parsed.default_format) setFormat(parsed.default_format);
+          if (parsed.default_type) setDownloadType(parsed.default_type);
+        }
+      } catch (err) {
+        console.error("Error loading user settings:", err);
+      }
+    };
+
+    // Load once on mount
+    loadSettings();
+
+    // ✅ Listen for real-time settings update from SettingsTab
+    const handleSettingsUpdate = () => loadSettings();
+    window.addEventListener("settingsUpdated", handleSettingsUpdate);
+
+    return () => {
+      window.removeEventListener("settingsUpdated", handleSettingsUpdate);
+    };
+  }, []);
+
+
+  // ============================================
+  // RENDER
+  // ============================================
   return (
     <div className="space-y-6">
+      {/* URL INPUT SECTION */}
       <div className="space-y-2">
         <Label htmlFor="url">Video URL</Label>
         <div className="flex gap-2">
-          <Input id="url" placeholder="Paste video URL" value={url} onChange={(e)=>setUrl(e.target.value)} />
-          <Button onClick={handlePreview} disabled={downloadStateRef.current.isLoading || !url} variant="outline">
-            {downloadStateRef.current.isLoading ? <Loader2 className="w-4 h-4 animate-spin"/> : <Eye className="w-4 h-4"/>} Preview
+          <Input
+            id="url"
+            placeholder="Paste video URL"
+            value={url}
+            onChange={(e) => setUrl(e.target.value)}
+            disabled={isDownloading}
+          />
+          <Button
+            onClick={handlePreview}
+            disabled={isLoading || !url || isDownloading}
+            variant="outline"
+          >
+            {isLoading ? (
+              <Loader2 className="w-4 h-4 animate-spin" />
+            ) : (
+              <Eye className="w-4 h-4" />
+            )}
+            Preview
           </Button>
         </div>
       </div>
 
-      {showPreview && videoInfo && <VideoPreview videoInfo={videoInfo}/>}
+      {/* VIDEO PREVIEW SECTION */}
+      {showPreview && videoInfo && <VideoPreview videoInfo={videoInfo} />}
 
+      {/* DOWNLOAD OPTIONS SECTION */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
         <div>
           <Label>Download Type</Label>
-          <Select value={downloadType} onValueChange={setDownloadType}>
-            <SelectTrigger><SelectValue/></SelectTrigger>
+          <Select value={downloadType} onValueChange={setDownloadType} disabled={isDownloading}>
+            <SelectTrigger>
+              <SelectValue />
+            </SelectTrigger>
             <SelectContent>
               <SelectItem value="video">Video</SelectItem>
               <SelectItem value="audio">Audio</SelectItem>
@@ -303,41 +503,83 @@ const DownloadTab = () => {
         </div>
         <div>
           <Label>Format</Label>
-          <Select value={format} onValueChange={setFormat}>
-            <SelectTrigger><SelectValue/></SelectTrigger>
+          <Select value={format} onValueChange={setFormat} disabled={isDownloading}>
+            <SelectTrigger>
+              <SelectValue />
+            </SelectTrigger>
             <SelectContent>
-              {formats[downloadType as keyof typeof formats].map(fmt => <SelectItem key={fmt} value={fmt.toLowerCase()}>{fmt}</SelectItem>)}
+              {formats[downloadType as keyof typeof formats]?.map((fmt) => (
+                <SelectItem key={fmt} value={fmt.toLowerCase()}>
+                  {fmt.toUpperCase()}
+                </SelectItem>
+              ))}
             </SelectContent>
           </Select>
         </div>
         <div>
           <Label>Quality</Label>
-          <Select value={quality} onValueChange={setQuality}>
-            <SelectTrigger><SelectValue/></SelectTrigger>
+          <Select value={quality} onValueChange={setQuality} disabled={isDownloading}>
+            <SelectTrigger>
+              <SelectValue />
+            </SelectTrigger>
             <SelectContent>
-              {qualities.map(q => <SelectItem key={q} value={q}>{q}</SelectItem>)}
+              {qualities.map((q) => (
+                <SelectItem key={q} value={q}>
+                  {q}
+                </SelectItem>
+              ))}
             </SelectContent>
           </Select>
         </div>
       </div>
 
-      {downloadStateRef.current.progress > 0 && (
+      {/* PROGRESS SECTION - ONLY SHOW WHEN DOWNLOADING */}
+      {isDownloading && (
         <div className="space-y-2">
           <div className="flex justify-between text-sm">
             <span>Download Progress</span>
-            <span>{Math.round(downloadStateRef.current.progress)}%</span>
+            <span>{progress.toFixed(1)}%</span>
           </div>
-          <Progress value={downloadStateRef.current.progress} className="h-2"/>
-          {downloadStateRef.current.status && <div className="text-sm font-mono text-gray-700">{downloadStateRef.current.status}</div>}
+          <Progress value={progress} className="h-2" />
+          {statusMessage && (
+            <div className="text-xs font-mono text-gray-600 bg-gray-50 p-2 rounded overflow-x-auto">
+              {statusMessage}
+            </div>
+          )}
         </div>
       )}
 
+      {/* ACTION BUTTONS SECTION */}
       <div className="flex gap-3">
-        <Button onClick={handleDownload} disabled={downloadStateRef.current.isLoading || !url} className="flex-1">
-          {downloadStateRef.current.isLoading ? <Loader2 className="w-4 h-4 animate-spin mr-2"/> : <Download className="w-4 h-4 mr-2"/>}
-          {downloadStateRef.current.isLoading ? "Downloading..." : "Download"}
+        {/* Download Button */}
+        {!isDownloading ? (
+          <Button
+            onClick={handleDownload}
+            disabled={isLoading || !url}
+            className="flex-1"
+          >
+            <Download className="w-4 h-4 mr-2" />
+            Download
+          </Button>
+        ) : (
+          <Button 
+            onClick={handleCancel} 
+            variant="destructive" 
+            className="flex-1"
+          >
+            <X className="w-4 h-4 mr-2" />
+            Cancel Download
+          </Button>
+        )}
+
+        {/* Clear Button */}
+        <Button 
+          onClick={clearForm} 
+          variant="outline"
+          disabled={isDownloading}
+        >
+          Clear
         </Button>
-        <Button onClick={clearForm} variant="outline">Clear</Button>
       </div>
     </div>
   );

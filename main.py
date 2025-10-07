@@ -1,4 +1,5 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks, WebSocket
+
+from fastapi import FastAPI, HTTPException, BackgroundTasks, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -14,6 +15,8 @@ import shutil
 import glob
 from typing import Optional, List, Dict, Any
 from urllib.parse import urlparse
+import asyncio
+import uuid
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,7 +39,6 @@ DOWNLOADS_DIR = "./downloads"
 COOKIES_FILE = "./cookies.txt"
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 
-# Enhanced yt-dlp base options with multi-platform support
 BASE_YDL_OPTS = {
     'quiet': True,
     'no_warnings': True,
@@ -51,13 +53,14 @@ if os.path.exists(COOKIES_FILE):
 else:
     logger.warning(f"⚠ No cookies file found at {COOKIES_FILE}")
 
+# Track active downloads for cancellation
+active_downloads: Dict[str, Dict[str, Any]] = {}
+
 def clean_filename(name: str) -> str:
-    """Clean filename for cross-platform compatibility"""
     name = re.sub(r'[\\/*?:"<>|｜]', "_", name)
-    return name.strip()[:200]  # Limit length
+    return name.strip()[:200]
 
 def cleanup_file(filepath: str):
-    """Safely remove file"""
     try:
         if os.path.exists(filepath):
             os.remove(filepath)
@@ -66,7 +69,6 @@ def cleanup_file(filepath: str):
         logger.error(f"Cleanup error for {filepath}: {e}")
 
 def detect_platform(url: str) -> str:
-    """Detect platform from URL"""
     domain = urlparse(url).netloc.lower()
     if 'youtube.com' in domain or 'youtu.be' in domain:
         return 'youtube'
@@ -87,27 +89,20 @@ def detect_platform(url: str) -> str:
     return 'unknown'
 
 def get_platform_opts(platform: str) -> Dict[str, Any]:
-    """Get platform-specific yt-dlp options"""
     opts = {}
-    
     if platform == 'tiktok':
         opts['extractor_args'] = {
             'tiktok': {
                 'api_hostname': 'api22-normal-c-useast2a.tiktokv.com',
             }
         }
-    elif platform == 'twitter':
-        # Remove twitter-specific API setting - use default
-        pass
     elif platform == 'instagram':
         opts['http_headers'] = {
             'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15',
         }
-    
     return opts
 
 def parse_quality_request(quality_str: str) -> int:
-    """Parse quality string to height value"""
     quality_map = {
         "144p": 144, "240p": 240, "360p": 360, "480p": 480,
         "720p": 720, "1080p": 1080, "1440p": 1440, "2160p": 2160,
@@ -116,17 +111,14 @@ def parse_quality_request(quality_str: str) -> int:
     return quality_map.get(quality_str, int(re.sub(r'\D', '', quality_str)) if re.search(r'\d', quality_str) else 720)
 
 def extract_format_info(fmt: Dict) -> Dict[str, Any]:
-    """Extract standardized format information from yt-dlp format dict"""
     height = fmt.get('height')
     width = fmt.get('width')
     
-    # Try to extract height from resolution string if not present
     if not height and fmt.get('resolution'):
         res_match = re.search(r'(\d+)x(\d+)', fmt.get('resolution', ''))
         if res_match:
             width, height = int(res_match.group(1)), int(res_match.group(2))
     
-    # Use tbr (total bitrate) as quality indicator if no height
     tbr = fmt.get('tbr') or 0
     quality_score = height if height else (tbr / 10 if tbr else 0)
     
@@ -144,7 +136,6 @@ def extract_format_info(fmt: Dict) -> Dict[str, Any]:
     }
 
 def find_best_format(formats: List[Dict], requested_height: int, format_type: str = 'video') -> Optional[Dict]:
-    """Find best matching format based on requested quality"""
     if not formats:
         return None
     
@@ -156,23 +147,18 @@ def find_best_format(formats: List[Dict], requested_height: int, format_type: st
     if not candidates:
         return None
     
-    # Extract format info
     processed = [extract_format_info(fmt) for fmt in candidates]
-    
-    # Filter by those with quality_score
     valid = [f for f in processed if f['quality_score'] > 0]
     if not valid:
-        return candidates[0]  # Fallback to first available
+        return candidates[0]
     
-    # Find closest match (prefer equal or lower quality)
     valid_sorted = sorted(valid, key=lambda x: (
-        abs(x['quality_score'] - requested_height),  # Closest match
-        -x['quality_score']  # Higher quality if tie
+        abs(x['quality_score'] - requested_height),
+        -x['quality_score']
     ))
     
     best = valid_sorted[0]
     
-    # Find original format dict
     for fmt in candidates:
         if fmt.get('format_id') == best['format_id']:
             logger.info(f"Selected format: {best['format_id']} - {best['resolution']} ({best['ext']}) for requested {requested_height}p")
@@ -181,7 +167,6 @@ def find_best_format(formats: List[Dict], requested_height: int, format_type: st
     return candidates[0]
 
 def get_format_details(formats: List[Dict]) -> tuple:
-    """Get categorized format details for API response"""
     video_formats = []
     audio_formats = []
     
@@ -207,7 +192,6 @@ def get_format_details(formats: List[Dict]) -> tuple:
                 "tbr": info['tbr'],
             })
     
-    # Remove duplicates based on resolution
     seen = set()
     unique_video = []
     for v in sorted(video_formats, key=lambda x: x.get('height', 0), reverse=True):
@@ -230,7 +214,6 @@ class DownloadRequest(BaseModel):
 
 @app.post("/api/video-info")
 async def get_video_info(req: VideoRequest):
-    """Get video information from any supported platform"""
     try:
         platform = detect_platform(req.url)
         logger.info(f"Detected platform: {platform} for URL: {req.url}")
@@ -280,274 +263,201 @@ async def get_video_info(req: VideoRequest):
     except Exception as e:
         logger.error(f"Video info error for {req.url}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to get video info: {str(e)}")
-@app.websocket("/ws/download")
-async def websocket_download(websocket: WebSocket):
-    """WebSocket endpoint for live download progress"""
+
+@app.websocket("/ws/download/{download_id}")
+async def websocket_download(websocket: WebSocket, download_id: str):
     await websocket.accept()
+    active_downloads[download_id] = {"active": True, "websocket": websocket}
+
     try:
         data = await websocket.receive_json()
         url = data.get("url")
         format_type = data.get("type", "video")
         quality = data.get("quality", "720p")
+        audio_format = data.get("format", "mp3")
 
         platform = detect_platform(url)
-        logger.info(f"WebSocket download started for {platform}: {url}")
+        logger.info(f"WebSocket download started (ID: {download_id}) for {platform}: {url}")
+
+        await websocket.send_json({"status": "initializing", "message": "Starting download..."})
 
         ydl_opts = BASE_YDL_OPTS.copy()
         ydl_opts.update(get_platform_opts(platform))
         ydl_opts['noplaylist'] = True
 
-        requested_height = parse_quality_request(quality)
+        loop = asyncio.get_event_loop()  # ✅ capture current loop for safe send
 
-        # Progress hook
         def progress_hook(d):
+            """Thread-safe progress updates for yt_dlp"""
+            if not active_downloads.get(download_id, {}).get("active", False):
+                raise yt_dlp.utils.DownloadCancelled("Download cancelled by user")
+
             if d['status'] == 'downloading':
-                percent = d.get('_percent_str', '0.0%')
-                total_bytes = d.get('_total_bytes_str', '0MiB')
-                speed = d.get('_speed_str', '0MiB/s')
-                eta = d.get('_eta_str', '0')
-                frag_info = f"(frag {d.get('fragment_index',0)}/{d.get('fragment_count',0)})"
-                msg = f"[download] {percent} of ~{total_bytes} at {speed} ETA {eta} {frag_info}"
-                asyncio.create_task(websocket.send_text(msg))
+                downloaded_bytes = d.get('downloaded_bytes', 0)
+                total_bytes = d.get('total_bytes') or d.get('total_bytes_estimate')
+
+                if total_bytes:
+                    percent = (downloaded_bytes / total_bytes) * 100
+                else:
+                    percent = 0.0
+
+                msg = {
+                    "status": "downloading",
+                    "percent": round(percent, 2),
+                    "total": d.get('_total_bytes_str', 'Unknown'),
+                    "speed": d.get('_speed_str', '0MiB/s'),
+                    "eta": d.get('_eta_str', 'Unknown'),
+                    "fragment_index": d.get('fragment_index', 0),
+                    "fragment_count": d.get('fragment_count', 0)
+                }
+
+                # ✅ use run_coroutine_threadsafe instead of create_task
+                asyncio.run_coroutine_threadsafe(websocket.send_json(msg), loop)
+
             elif d['status'] == 'finished':
-                asyncio.create_task(websocket.send_text("DONE"))
+                asyncio.run_coroutine_threadsafe(
+                    websocket.send_json({"status": "processing", "message": "Processing file..."}),
+                    loop
+                )
 
         ydl_opts['progress_hooks'] = [progress_hook]
 
-        # Determine format
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
+
+        base_filename = clean_filename(info.get('title', 'video'))
+
+        if format_type == "audio":
+            ydl_opts['outtmpl'] = os.path.join(DOWNLOADS_DIR, f"{base_filename}.%(ext)s")
+            ydl_opts['format'] = 'bestaudio/best'
+            ydl_opts['postprocessors'] = [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': audio_format,
+                'preferredquality': '192',
+            }]
+            final_ext = audio_format
+        else:
+            requested_height = parse_quality_request(quality)
             formats = info.get('formats', [])
-            best_format = find_best_format(formats, requested_height, format_type)
+            best_format = find_best_format(formats, requested_height, 'video')
+
             if best_format:
                 ydl_opts['format'] = f"{best_format['format_id']}+bestaudio/best"
             else:
                 ydl_opts['format'] = 'best'
 
-            # Download file
-            ydl.download([url])
+            ydl_opts['outtmpl'] = os.path.join(DOWNLOADS_DIR, f"{base_filename}.%(ext)s")
+            ydl_opts['merge_output_format'] = 'mp4'
+            final_ext = 'mp4'
 
+        # ✅ Run yt-dlp in thread to avoid blocking event loop
+        def run_download():
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+
+        await asyncio.to_thread(run_download)
+
+        if not active_downloads.get(download_id, {}).get("active", False):
+            await websocket.send_json({"status": "cancelled", "message": "Download cancelled"})
+            return
+
+        possible_files = glob.glob(os.path.join(DOWNLOADS_DIR, f"{base_filename}*.{final_ext}"))
+        if not possible_files:
+            for ext in ['mp4', 'webm', 'mkv', 'mp3', 'm4a', 'opus']:
+                possible_files = glob.glob(os.path.join(DOWNLOADS_DIR, f"{base_filename}*.{ext}"))
+                if possible_files:
+                    break
+
+        if not possible_files:
+            await websocket.send_json({"status": "error", "message": "Downloaded file not found"})
+            return
+
+        filename = os.path.basename(possible_files[0])
+        await websocket.send_json({
+            "status": "completed",
+            "message": "Download completed successfully",
+            "filename": filename
+        })
+
+    except yt_dlp.utils.DownloadCancelled:
+        logger.info(f"Download {download_id} cancelled by user")
+        await websocket.send_json({"status": "cancelled", "message": "Download cancelled by user"})
+    except WebSocketDisconnect:
+        logger.info(f"WebSocket disconnected for download {download_id}")
     except Exception as e:
-        await websocket.send_text(f"ERROR: {str(e)}")
         logger.error(f"WebSocket download error: {e}", exc_info=True)
+        try:
+            await websocket.send_json({"status": "error", "message": str(e)})
+        except:
+            pass
     finally:
-        await websocket.close()
+        active_downloads.pop(download_id, None)
+        try:
+            await websocket.close()
+        except:
+            pass
 
-@app.post("/api/download")
-async def download_video(req: DownloadRequest, background_tasks: BackgroundTasks):
-    """Universal download endpoint for all platforms"""
-    try:
-        platform = detect_platform(req.url)
-        logger.info(f"Starting download from {platform}: {req.url}")
+@app.post("/api/cancel/{download_id}")
+async def cancel_download(download_id: str):
+    if download_id in active_downloads:
+        active_downloads[download_id]["active"] = False
+        logger.info(f"Cancellation requested for download {download_id}")
         
-        ydl_opts = BASE_YDL_OPTS.copy()
-        ydl_opts.update(get_platform_opts(platform))
-        ydl_opts['noplaylist'] = not req.playlist
+        # Try to close websocket
+        try:
+            ws = active_downloads[download_id].get("websocket")
+            if ws:
+                await ws.send_json({"status": "cancelled", "message": "Download cancelled by user"})
+        except:
+            pass
         
-        # Get video info first
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(req.url, download=False)
-        
-        # Validate audio format
-        if req.type == "audio" and req.quality not in ["mp3", "m4a", "opus", "webm", "aac"]:
-            raise HTTPException(status_code=400, detail=f"Invalid audio format: {req.quality}")
-        
-        # Handle playlist downloads
-        if req.playlist and info.get("_type") == "playlist":
-            if req.type not in ["video", "audio"]:
-                raise HTTPException(status_code=400, detail="Playlist download only supports video/audio")
-            
-            return await handle_playlist_download(req, info, ydl_opts, background_tasks)
-        
-        # Single video/audio handling
-        if info.get("_type") == "playlist":
-            info = next((e for e in info['entries'] if e), None)
-            if not info:
-                raise ValueError("Playlist is empty")
-        
-        url = info.get('webpage_url') or info.get('url') or req.url
-        
-        # Thumbnail download
-        if req.type == "thumbnail":
-            return await download_thumbnail(info, background_tasks)
-        
-        # Audio download
-        if req.type == "audio":
-            return await download_audio(info, url, req.quality, ydl_opts, background_tasks)
-        
-        # Video download
-        return await download_video_file(info, url, req.quality, ydl_opts, background_tasks)
-        
-    except Exception as e:
-        logger.error(f"Download error for {req.url}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Download failed: {str(e)}")
+        return {"status": "cancelled", "message": "Download cancellation requested"}
+    return {"status": "not_found", "message": "Download not found"}
 
-async def handle_playlist_download(req: DownloadRequest, info: Dict, ydl_opts: Dict, background_tasks: BackgroundTasks):
-    """Handle playlist downloads with zipping"""
-    playlist_title = info.get("title", "playlist")
-    subdir = os.path.join(DOWNLOADS_DIR, clean_filename(playlist_title))
-    os.makedirs(subdir, exist_ok=True)
-    zip_filename = clean_filename(f"{playlist_title}.zip")
-    zip_path = os.path.join(DOWNLOADS_DIR, zip_filename)
-    
-    ydl_opts["outtmpl"] = os.path.join(subdir, "%(playlist_index)s_%(title)s.%(ext)s")
-    
-    if req.type == "audio":
-        ydl_opts.update({
-            'format': 'bestaudio/best',
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': req.quality,
-                'preferredquality': '192',
-            }],
-        })
-    else:
-        requested_height = parse_quality_request(req.quality)
-        ydl_opts.update({
-            'format': f'bestvideo[height<={requested_height}]+bestaudio/best[height<={requested_height}]/best',
-            'merge_output_format': 'mp4',
-        })
-    
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([req.url])
-    
-    # Zip the playlist
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
-        for root, _, files in os.walk(subdir):
-            for file in files:
-                file_path = os.path.join(root, file)
-                arcname = os.path.join(clean_filename(playlist_title), file)
-                zipf.write(file_path, arcname=arcname)
-    
-    background_tasks.add_task(cleanup_file, zip_path)
-    # Keep playlist folder for now
-    # background_tasks.add_task(shutil.rmtree, subdir, ignore_errors=True)
-    
-    return FileResponse(path=zip_path, media_type="application/zip", filename=zip_filename)
+import asyncio
+from urllib.parse import quote
+async def delayed_cleanup(filepath: str, delay: int = 10):
+    """Wait a few seconds before deleting file to let the client finish downloading."""
+    await asyncio.sleep(delay)
+    if os.path.exists(filepath):
+        os.remove(filepath)
+        print(f"🧹 Cleaned up after {delay}s: {filepath}")
 
-async def download_thumbnail(info: Dict, background_tasks: BackgroundTasks):
-    """Download video thumbnail"""
-    thumbnail_url = info.get('thumbnail')
-    if not thumbnail_url:
-        raise ValueError("No thumbnail available")
+@app.get("/downloads/{filename}")
+async def serve_download(filename: str, background_tasks: BackgroundTasks):
+    """Serve downloaded file and cleanup after"""
+    file_path = os.path.join(DOWNLOADS_DIR, filename)
     
-    filename = clean_filename(f"{info['title']}.jpg")
-    full_path = os.path.join(DOWNLOADS_DIR, filename)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found")
     
-    response = requests.get(thumbnail_url, stream=True, timeout=30)
-    response.raise_for_status()
+    # Schedule cleanup
+    background_tasks.add_task(cleanup_file, file_path)
     
-    with open(full_path, "wb") as f:
-        for chunk in response.iter_content(chunk_size=8192):
-            if chunk:
-                f.write(chunk)
+    ext = os.path.splitext(filename)[1].lower()
+    media_types = {
+        '.mp4': 'video/mp4',
+        '.mp3': 'audio/mpeg',
+        '.m4a': 'audio/mp4',
+        '.webm': 'video/webm',
+        '.mkv': 'video/x-matroska',
+        '.jpg': 'image/jpeg',
+        '.png': 'image/png',
+    }
+    media_type = media_types.get(ext, 'application/octet-stream')
     
-    # Don't cleanup - keep downloaded files
-    # background_tasks.add_task(cleanup_file, full_path)
-    return FileResponse(path=full_path, media_type="image/jpeg", filename=filename)
+    quoted_filename = quote(filename)  # ✅ Fix special chars
+    headers = {"Content-Disposition": f'attachment; filename="{quoted_filename}"; filename*=UTF-8\'\'{quoted_filename}'}
+    
+    return FileResponse(
+        path=file_path,
+        media_type=media_type,
+        headers=headers
+    )
 
-async def download_audio(info: Dict, url: str, audio_format: str, ydl_opts: Dict, background_tasks: BackgroundTasks):
-    """Download audio in requested format"""
-    filename = clean_filename(f"{info['title']}.{audio_format}")
-    full_path = os.path.join(DOWNLOADS_DIR, filename)
-    
-    ydl_opts.update({
-        'outtmpl': full_path,
-        'format': 'bestaudio/best',
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': audio_format,
-            'preferredquality': '192',
-        }],
-    })
-    
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([url])
-    
-    # Handle actual downloaded file
-    if not os.path.exists(full_path):
-        base = os.path.splitext(full_path)[0]
-        for ext in [audio_format, 'opus', 'm4a', 'webm', 'mp3']:
-            test_path = f"{base}.{ext}"
-            if os.path.exists(test_path):
-                full_path = test_path
-                filename = os.path.basename(test_path)
-                break
-        else:
-            raise HTTPException(status_code=500, detail="Audio file not found after download")
-    
-    # Don't cleanup - keep downloaded files
-    # background_tasks.add_task(cleanup_file, full_path)
-    content_type = f'audio/{audio_format}' if audio_format != 'mp3' else 'audio/mpeg'
-    return FileResponse(path=full_path, media_type=content_type, filename=filename)
-
-async def download_video_file(info: Dict, url: str, quality: str, ydl_opts: Dict, background_tasks: BackgroundTasks):
-    """Download video with quality matching"""
-    requested_height = parse_quality_request(quality)
-    formats = info.get('formats', [])
-    
-    # Find best matching format
-    best_format = find_best_format(formats, requested_height, 'video')
-    
-    if not best_format:
-        raise HTTPException(status_code=400, detail="No suitable video format found")
-    
-    actual_height = best_format.get('height', requested_height)
-    logger.info(f"Downloading video: requested={requested_height}p, actual={actual_height}p, format={best_format.get('format_id')}")
-    
-    base_filename = clean_filename(info['title'])
-    outtmpl = os.path.join(DOWNLOADS_DIR, f"{base_filename}.%(ext)s")
-    
-    ydl_opts.update({
-        'outtmpl': outtmpl,
-        'format': f"{best_format['format_id']}+bestaudio/best",
-        'merge_output_format': 'mp4',
-    })
-    
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([url])
-    
-    # Find downloaded file
-    possible_files = []
-    for ext in ['mp4', 'MP4', 'webm', 'mkv', 'mov', 'avi']:
-        possible_files.extend(glob.glob(os.path.join(DOWNLOADS_DIR, f"{base_filename}*.{ext}")))
-    
-    if not possible_files:
-        raise HTTPException(status_code=500, detail="Video file not found after download")
-    
-    input_file = possible_files[0]
-    output_file = os.path.join(DOWNLOADS_DIR, f"{base_filename}_{quality}.mp4")
-    
-    # Scale if needed
-    if actual_height != requested_height:
-        logger.info(f"Scaling video from {actual_height}p to {requested_height}p")
-        cmd = f'"{FFMPEG_PATH}" -i "{input_file}" -vf "scale=-2:{requested_height}" -c:v libx264 -preset fast -c:a copy "{output_file}"'
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-        
-        if result.returncode != 0:
-            logger.warning(f"FFmpeg scaling failed, trying without audio: {result.stderr}")
-            cmd = f'"{FFMPEG_PATH}" -i "{input_file}" -vf "scale=-2:{requested_height}" -c:v libx264 -preset fast -an "{output_file}"'
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-            
-            if result.returncode != 0:
-                logger.error(f"FFmpeg failed: {result.stderr}")
-                output_file = input_file
-    else:
-        output_file = input_file
-    
-    # Cleanup
-    if os.path.exists(input_file) and input_file != output_file:
-        os.remove(input_file)
-    
-    # Don't schedule cleanup - keep downloaded files
-    # background_tasks.add_task(cleanup_file, output_file)
-    filename = os.path.basename(output_file)
-    
-    return FileResponse(path=output_file, media_type="video/mp4", filename=filename)
 
 @app.get("/")
 async def root():
-    """Health check"""
     return {
         "status": "running",
         "message": "Universal Multi-Platform Video Downloader API",
