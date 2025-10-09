@@ -51,6 +51,12 @@ interface DownloadState {
   downloadType: string;
 }
 
+interface UserSelections {
+  quality: string;
+  format: string;
+  downloadType: string;
+}
+
 // ============================================
 // MAIN COMPONENT
 // ============================================
@@ -75,6 +81,7 @@ const DownloadTab = () => {
   
   const { toast } = useToast();
   const wsRef = useRef<WebSocket | null>(null);
+  const isInitialMount = useRef(true);
 
   // ============================================
   // CONSTANTS
@@ -86,7 +93,7 @@ const DownloadTab = () => {
   const qualities = ["4K", "2K", "1080p", "720p", "480p", "360p", "240p", "144p"];
 
   // ============================================
-  // LOAD SAVED STATE ON MOUNT
+  // FIX 1: LOAD INITIAL STATE ONLY ONCE
   // ============================================
   useEffect(() => {
     try {
@@ -103,12 +110,29 @@ const DownloadTab = () => {
         setUrl(parsed.url);
       }
 
+      // ✅ FIX: Load user selections FIRST (before settings defaults)
+      const savedSelections = localStorage.getItem("userSelections");
+      if (savedSelections) {
+        const selections: UserSelections = JSON.parse(savedSelections);
+        setQuality(selections.quality);
+        setFormat(selections.format);
+        setDownloadType(selections.downloadType);
+      } else {
+        // Only load settings defaults if no user selections exist
+        const savedSettings = localStorage.getItem("userSettings");
+        if (savedSettings) {
+          const parsed = JSON.parse(savedSettings);
+          if (parsed.default_quality) setQuality(parsed.default_quality);
+          if (parsed.default_format) setFormat(parsed.default_format);
+          if (parsed.default_type) setDownloadType(parsed.default_type);
+        }
+      }
+
       // Load active download state
       const savedDownloadState = localStorage.getItem("activeDownloadState");
       if (savedDownloadState) {
         const downloadState: DownloadState = JSON.parse(savedDownloadState);
         
-        // Restore download state
         setIsDownloading(downloadState.isDownloading);
         setProgress(downloadState.progress);
         setStatusMessage(downloadState.statusMessage);
@@ -118,20 +142,38 @@ const DownloadTab = () => {
         setFormat(downloadState.format);
         setDownloadType(downloadState.downloadType);
 
-        // Show notification about restored state
+        // ✅ FIX 2: Reconnect WebSocket if download was active
         if (downloadState.isDownloading && downloadState.downloadId) {
+          reconnectWebSocket(downloadState.downloadId);
           toast({
-            title: "Download State Restored",
-            description: "Your previous download was in progress. You can cancel it if needed."
+            title: "Download Resumed",
+            description: "Reconnected to your active download"
           });
         }
       }
+
+      isInitialMount.current = false;
     } catch (err) {
       console.error("Error loading saved state:", err);
       localStorage.removeItem("downloadHistory");
       localStorage.removeItem("activeDownloadState");
+      localStorage.removeItem("userSelections");
     }
   }, []);
+
+  // ============================================
+  // FIX 1: PERSIST USER SELECTIONS ON CHANGE
+  // ============================================
+  useEffect(() => {
+    if (!isInitialMount.current) {
+      const selections: UserSelections = {
+        quality,
+        format,
+        downloadType
+      };
+      localStorage.setItem("userSelections", JSON.stringify(selections));
+    }
+  }, [quality, format, downloadType]);
 
   // ============================================
   // SAVE DOWNLOAD STATE ON CHANGE
@@ -153,6 +195,73 @@ const DownloadTab = () => {
       localStorage.removeItem("activeDownloadState");
     }
   }, [isDownloading, progress, statusMessage, downloadId, url, quality, format, downloadType]);
+
+  // ============================================
+  // FIX 2: RECONNECT WEBSOCKET FUNCTION
+  // ============================================
+  const reconnectWebSocket = (existingDownloadId: string) => {
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      return; // Already connected
+    }
+
+    const ws = new WebSocket(`ws://127.0.0.1:8000/ws/download/${existingDownloadId}`);
+    wsRef.current = ws;
+
+    ws.onopen = () => {
+      console.log("✅ WebSocket reconnected for download:", existingDownloadId);
+    };
+
+    ws.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+      console.log("WS DATA (reconnected):", data);
+
+      if (data.status === "downloading") {
+        const percentNum = typeof data.percent === "number" ? data.percent : parseFloat(data.percent);
+        setProgress(percentNum);
+
+        const fragInfo = data.fragment_count > 0 
+          ? ` (frag ${data.fragment_index}/${data.fragment_count})`
+          : "";
+
+        setStatusMessage(
+          `[download] ${percentNum.toFixed(1)}% of ~${data.total} at ${data.speed} ETA ${data.eta}${fragInfo}`
+        );
+      } 
+      else if (data.status === "processing") {
+        setProgress(95);
+        setStatusMessage(data.message);
+      } 
+      else if (data.status === "completed") {
+        setProgress(100);
+        setStatusMessage("Download Complete!");
+        setTimeout(() => downloadFile(data.filename), 500);
+      } 
+      else if (data.status === "cancelled") {
+        setStatusMessage("Download cancelled");
+        toast({
+          title: "Download Cancelled",
+          description: "Download stopped by user"
+        });
+        resetDownloadState();
+      } 
+      else if (data.status === "error") {
+        toast({
+          title: "Download Failed",
+          description: data.message,
+          variant: "destructive"
+        });
+        resetDownloadState();
+      }
+    };
+
+    ws.onerror = (error) => {
+      console.error("WebSocket error:", error);
+    };
+
+    ws.onclose = () => {
+      wsRef.current = null;
+    };
+  };
 
   // ============================================
   // SAVE TO HISTORY
@@ -252,7 +361,6 @@ const DownloadTab = () => {
         setStatusMessage(data.message);
       } 
       else if (data.status === "downloading") {
-        // ✅ backend sends float now, so no need to replace('%')
         const percentNum = typeof data.percent === "number" ? data.percent : parseFloat(data.percent);
         setProgress(percentNum);
 
@@ -305,7 +413,6 @@ const DownloadTab = () => {
     };
   };
 
-
   // ============================================
   // DOWNLOAD FILE FROM SERVER
   // ============================================
@@ -326,7 +433,7 @@ const DownloadTab = () => {
       const downloadUrl = window.URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = downloadUrl;
-      a.download = sanitizeFilename(filename); // ✅ sanitize filename
+      a.download = sanitizeFilename(filename);
       document.body.appendChild(a);
       a.click();
       a.remove();
@@ -349,7 +456,6 @@ const DownloadTab = () => {
     }
   };
 
-
   // ============================================
   // RESET DOWNLOAD STATE
   // ============================================
@@ -371,13 +477,11 @@ const DownloadTab = () => {
     }
 
     try {
-      // Close WebSocket first
       if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
         wsRef.current.close();
         wsRef.current = null;
       }
 
-      // Send cancellation request to backend
       await axios.post(`http://127.0.0.1:8000/api/cancel/${downloadId}`);
       
       toast({
@@ -421,36 +525,8 @@ const DownloadTab = () => {
   };
 
   // ============================================
-  //   SYNC SETTINGS WITH SETTINGS TAB
+  // REMOVED: Settings sync effect that was overwriting selections
   // ============================================
-  useEffect(() => {
-    const loadSettings = () => {
-      try {
-        const saved = localStorage.getItem("userSettings");
-        if (saved) {
-          const parsed = JSON.parse(saved);
-          // ✅ Fixed key names and fallback
-          if (parsed.default_quality) setQuality(parsed.default_quality);
-          if (parsed.default_format) setFormat(parsed.default_format);
-          if (parsed.default_type) setDownloadType(parsed.default_type);
-        }
-      } catch (err) {
-        console.error("Error loading user settings:", err);
-      }
-    };
-
-    // Load once on mount
-    loadSettings();
-
-    // ✅ Listen for real-time settings update from SettingsTab
-    const handleSettingsUpdate = () => loadSettings();
-    window.addEventListener("settingsUpdated", handleSettingsUpdate);
-
-    return () => {
-      window.removeEventListener("settingsUpdated", handleSettingsUpdate);
-    };
-  }, []);
-
 
   // ============================================
   // RENDER
@@ -533,7 +609,7 @@ const DownloadTab = () => {
         </div>
       </div>
 
-      {/* PROGRESS SECTION - ONLY SHOW WHEN DOWNLOADING */}
+      {/* PROGRESS SECTION */}
       {isDownloading && (
         <div className="space-y-2">
           <div className="flex justify-between text-sm">
@@ -551,7 +627,6 @@ const DownloadTab = () => {
 
       {/* ACTION BUTTONS SECTION */}
       <div className="flex gap-3">
-        {/* Download Button */}
         {!isDownloading ? (
           <Button
             onClick={handleDownload}
@@ -572,7 +647,6 @@ const DownloadTab = () => {
           </Button>
         )}
 
-        {/* Clear Button */}
         <Button 
           onClick={clearForm} 
           variant="outline"

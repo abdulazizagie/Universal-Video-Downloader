@@ -1,0 +1,6 @@
+{
+  "default_quality": "144p",
+  "default_format": "mp4",
+  "default_type": "video",
+  "max_concurrent_downloads": 3
+}

@@ -100,67 +100,7 @@ const SettingsTab = () => {
           </CardTitle>
         </CardHeader>
         <CardContent className="space-y-6">
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-            <div className="space-y-2">
-              <Label htmlFor="defaultQuality">Default Quality</Label>
-              <Select
-                value={settings.default_quality}
-                onValueChange={(value) => updateSetting("default_quality", value)}
-              >
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="4K">4K Ultra HD</SelectItem>
-                  <SelectItem value="2K">2K</SelectItem>
-                  <SelectItem value="1080p">1080p Full HD</SelectItem>
-                  <SelectItem value="720p">720p HD</SelectItem>
-                  <SelectItem value="480p">480p</SelectItem>
-                  <SelectItem value="360p">360p</SelectItem>
-                  <SelectItem value="240p">240p</SelectItem>
-                  <SelectItem value="144p">144p</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
 
-            <div className="space-y-2">
-              <Label htmlFor="defaultFormat">Default Format</Label>
-              <Select
-                value={settings.default_format}
-                onValueChange={(value) => updateSetting("default_format", value)}
-              >
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="mp4">MP4</SelectItem>
-                  <SelectItem value="webm">WEBM</SelectItem>
-                  <SelectItem value="avi">AVI</SelectItem>
-                  <SelectItem value="mov">MOV</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-          </div>
-
-          <div className="space-y-2">
-            <Label htmlFor="maxDownloads">Maximum Concurrent Downloads</Label>
-            <Select
-              value={settings.max_concurrent_downloads.toString()}
-              onValueChange={(value) =>
-                updateSetting("max_concurrent_downloads", parseInt(value))
-              }
-            >
-              <SelectTrigger>
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="1">1 Download</SelectItem>
-                <SelectItem value="2">2 Downloads</SelectItem>
-                <SelectItem value="3">3 Downloads</SelectItem>
-                <SelectItem value="5">5 Downloads</SelectItem>
-              </SelectContent>
-            </Select>
-          </div>
 
           <div className="flex items-center justify-between">
             <div className="space-y-1">
