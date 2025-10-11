@@ -7,6 +7,8 @@ import requests
 import logging
 import re
 import imageio_ffmpeg
+from fastapi import UploadFile, File, Form
+import aiofiles
 import os
 import subprocess
 import zipfile
@@ -378,6 +380,8 @@ class SettingsRequest(BaseModel):
     default_format: str = "mp4"
     default_type: str = "video"
     max_concurrent_downloads: int = 3
+    
+
 
 # ============================================
 # Step 4: Enhanced Video Information Endpoint
@@ -1180,6 +1184,430 @@ async def debug_formats(req: VideoRequest):
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+# ============================================
+# NEW: Video Conversion Models & Functions
+# ============================================
+
+class ConvertRequest(BaseModel):
+    filename: str
+    output_format: str = "mp4"
+    quality: str = "auto"
+    resolution: str = "original"
+
+class UploadRequest(BaseModel):
+    filename: str
+    original_format: str
+
+# NEW: Video conversion utility functions
+def get_video_info(file_path: str) -> Dict[str, Any]:
+    """Get video information using ffprobe"""
+    try:
+        ffprobe_cmd = [
+            FFMPEG_PATH.replace('ffmpeg', 'ffprobe'),
+            '-v', 'quiet',
+            '-print_format', 'json',
+            '-show_format',
+            '-show_streams',
+            file_path
+        ]
+        result = subprocess.run(ffprobe_cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            return json.loads(result.stdout)
+        return {}
+    except Exception as e:
+        logger.error(f"Error getting video info: {e}")
+        return {}
+
+def convert_video(input_path: str, output_path: str, output_format: str, quality: str, resolution: str):
+    """Convert video to different format/quality"""
+    try:
+        ffmpeg_cmd = [FFMPEG_PATH, '-i', input_path]
+        
+        # Set video quality
+        if quality != "auto" and quality != "original":
+            if quality == "high":
+                ffmpeg_cmd.extend(['-crf', '18'])  # High quality
+            elif quality == "medium":
+                ffmpeg_cmd.extend(['-crf', '23'])  # Medium quality
+            elif quality == "low":
+                ffmpeg_cmd.extend(['-crf', '28'])  # Low quality
+            elif quality == "smallest":
+                ffmpeg_cmd.extend(['-crf', '32'])  # Smallest size
+        
+        # Set resolution
+        if resolution != "original":
+            ffmpeg_cmd.extend(['-vf', f'scale={resolution}'])
+        
+        # Set output format options
+        if output_format == "mp4":
+            ffmpeg_cmd.extend([
+                '-c:v', 'libx264',
+                '-c:a', 'aac',
+                '-movflags', '+faststart',
+                '-preset', 'medium'
+            ])
+        elif output_format == "webm":
+            ffmpeg_cmd.extend([
+                '-c:v', 'libvpx-vp9',
+                '-c:a', 'libopus',
+                '-b:v', '1M',
+                '-crf', '30'
+            ])
+        elif output_format == "avi":
+            ffmpeg_cmd.extend([
+                '-c:v', 'mpeg4',
+                '-c:a', 'mp3',
+                '-q:v', '5'
+            ])
+        elif output_format == "mov":
+            ffmpeg_cmd.extend([
+                '-c:v', 'libx264',
+                '-c:a', 'aac',
+                '-preset', 'medium'
+            ])
+        
+        ffmpeg_cmd.append('-y')  # Overwrite output file
+        ffmpeg_cmd.append(output_path)
+        
+        logger.info(f"Conversion command: {' '.join(ffmpeg_cmd)}")
+        
+        result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise Exception(f"FFmpeg error: {result.stderr}")
+        
+        return True
+    except Exception as e:
+        logger.error(f"Video conversion error: {e}")
+        raise
+
+# ============================================
+# NEW: Video Upload & Conversion Endpoints
+# ============================================
+
+@app.post("/api/upload-video")
+async def upload_video(file: UploadFile, background_tasks: BackgroundTasks):
+    """Upload video file for conversion"""
+    try:
+        # Validate file type
+        allowed_extensions = ['.mp4', '.avi', '.mov', '.webm', '.mkv', '.flv', '.wmv']
+        file_extension = os.path.splitext(file.filename)[1].lower()
+        
+        if file_extension not in allowed_extensions:
+            raise HTTPException(status_code=400, detail="Unsupported file format")
+        
+        # Generate unique filename
+        file_id = str(uuid.uuid4())
+        original_filename = f"{file_id}_original{file_extension}"
+        original_path = os.path.join(DOWNLOADS_DIR, original_filename)
+        
+        # Save uploaded file
+        with open(original_path, "wb") as buffer:
+            content = await file.read()
+            buffer.write(content)
+        
+        # Get video info
+        video_info = get_video_info(original_path)
+        
+        # Save upload record
+        upload_entry = {
+            "id": file_id,
+            "original_filename": file.filename,
+            "stored_filename": original_filename,
+            "file_size": len(content),
+            "upload_time": datetime.now().isoformat(),
+            "video_info": video_info
+        }
+        
+        return {
+            "file_id": file_id,
+            "original_filename": file.filename,
+            "stored_filename": original_filename,
+            "file_size": len(content),
+            "video_info": video_info,
+            "message": "Video uploaded successfully"
+        }
+        
+    except Exception as e:
+        logger.error(f"Upload error: {e}")
+        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+
+@app.post("/api/convert-video")
+async def convert_video_endpoint(req: ConvertRequest, background_tasks: BackgroundTasks):
+    """Convert uploaded video to different format/quality"""
+    try:
+        # Find original file
+        original_pattern = os.path.join(DOWNLOADS_DIR, f"{req.filename}_original.*")
+        original_files = glob.glob(original_pattern)
+        
+        if not original_files:
+            raise HTTPException(status_code=404, detail="Original video not found")
+        
+        original_path = original_files[0]
+        original_extension = os.path.splitext(original_path)[1]
+        
+        # Generate output filename
+        output_filename = f"{req.filename}_converted.{req.output_format}"
+        output_path = os.path.join(DOWNLOADS_DIR, output_filename)
+        
+        # Convert video
+        await asyncio.to_thread(
+            convert_video, 
+            original_path, 
+            output_path, 
+            req.output_format, 
+            req.quality, 
+            req.resolution
+        )
+        
+        # Get converted file info
+        converted_size = os.path.getsize(output_path)
+        video_info = get_video_info(output_path)
+        
+        # Save conversion record
+        conversion_entry = {
+            "id": str(uuid.uuid4()),
+            "original_file": req.filename,
+            "converted_file": output_filename,
+            "output_format": req.output_format,
+            "quality": req.quality,
+            "resolution": req.resolution,
+            "file_size": converted_size,
+            "conversion_time": datetime.now().isoformat(),
+            "video_info": video_info
+        }
+        
+        return {
+            "converted_filename": output_filename,
+            "file_size": converted_size,
+            "video_info": video_info,
+            "download_url": f"http://localhost:8000/downloads/{output_filename}",
+            "message": "Video converted successfully"
+        }
+        
+    except Exception as e:
+        logger.error(f"Conversion error: {e}")
+        raise HTTPException(status_code=500, detail=f"Conversion failed: {str(e)}")
+
+@app.get("/api/uploaded-videos")
+async def get_uploaded_videos():
+    """Get list of uploaded videos"""
+    try:
+        uploaded_videos = []
+        pattern = os.path.join(DOWNLOADS_DIR, "*_original.*")
+        
+        for file_path in glob.glob(pattern):
+            filename = os.path.basename(file_path)
+            file_id = filename.split('_original')[0]
+            file_size = os.path.getsize(file_path)
+            video_info = get_video_info(file_path)
+            
+            uploaded_videos.append({
+                "file_id": file_id,
+                "filename": filename,
+                "file_size": file_size,
+                "video_info": video_info,
+                "upload_time": datetime.fromtimestamp(os.path.getctime(file_path)).isoformat()
+            })
+        
+        return {"uploaded_videos": uploaded_videos}
+    except Exception as e:
+        logger.error(f"Error getting uploaded videos: {e}")
+        return {"uploaded_videos": []}
+
+@app.delete("/api/uploaded-videos/{file_id}")
+async def delete_uploaded_video(file_id: str):
+    """Delete uploaded video and its conversions"""
+    try:
+        # Find and delete original file
+        original_pattern = os.path.join(DOWNLOADS_DIR, f"{file_id}_original.*")
+        original_files = glob.glob(original_pattern)
+        
+        # Find and delete converted files
+        converted_pattern = os.path.join(DOWNLOADS_DIR, f"{file_id}_converted.*")
+        converted_files = glob.glob(converted_pattern)
+        
+        deleted_files = []
+        
+        for file_path in original_files + converted_files:
+            try:
+                os.remove(file_path)
+                deleted_files.append(os.path.basename(file_path))
+            except Exception as e:
+                logger.error(f"Error deleting {file_path}: {e}")
+        
+        return {
+            "message": "Video files deleted successfully",
+            "deleted_files": deleted_files
+        }
+        
+    except Exception as e:
+        logger.error(f"Error deleting video: {e}")
+        raise HTTPException(status_code=500, detail=f"Delete failed: {str(e)}")
+# Add this WebSocket endpoint to your backend
+@app.websocket("/ws/convert/{conversion_id}")
+async def websocket_convert(websocket: WebSocket, conversion_id: str):
+    await websocket.accept()
+    
+    try:
+        # Wait for conversion start message
+        data = await websocket.receive_json()
+        filename = data.get("filename")
+        output_format = data.get("output_format")
+        quality = data.get("quality")
+        resolution = data.get("resolution")
+        
+        if not filename:
+            await websocket.send_json({"status": "error", "message": "No filename provided"})
+            return
+        
+        # Find original file
+        original_pattern = os.path.join(DOWNLOADS_DIR, f"{filename}_original.*")
+        original_files = glob.glob(original_pattern)
+        
+        if not original_files:
+            await websocket.send_json({"status": "error", "message": "Original video not found"})
+            return
+        
+        original_path = original_files[0]
+        output_filename = f"{filename}_converted.{output_format}"
+        output_path = os.path.join(DOWNLOADS_DIR, output_filename)
+        
+        await websocket.send_json({"status": "initializing", "message": "Starting conversion..."})
+        
+        # Enhanced conversion function with progress reporting
+        async def convert_with_progress():
+            try:
+                # Get original file size for progress calculation
+                original_size = os.path.getsize(original_path)
+                
+                ffmpeg_cmd = [
+                    FFMPEG_PATH, 
+                    '-i', original_path,
+                    '-progress', 'pipe:1',  # Send progress to stdout
+                    '-loglevel', 'info'
+                ]
+                
+                # Set video quality
+                if quality != "auto" and quality != "original":
+                    if quality == "high":
+                        ffmpeg_cmd.extend(['-crf', '18'])
+                    elif quality == "medium":
+                        ffmpeg_cmd.extend(['-crf', '23'])
+                    elif quality == "low":
+                        ffmpeg_cmd.extend(['-crf', '28'])
+                    elif quality == "smallest":
+                        ffmpeg_cmd.extend(['-crf', '32'])
+                
+                # Set resolution
+                if resolution != "original":
+                    ffmpeg_cmd.extend(['-vf', f'scale={resolution}'])
+                
+                # Set output format options
+                if output_format == "mp4":
+                    ffmpeg_cmd.extend([
+                        '-c:v', 'libx264',
+                        '-c:a', 'aac',
+                        '-movflags', '+faststart',
+                        '-preset', 'medium'
+                    ])
+                elif output_format == "webm":
+                    ffmpeg_cmd.extend([
+                        '-c:v', 'libvpx-vp9',
+                        '-c:a', 'libopus',
+                        '-b:v', '1M',
+                        '-crf', '30'
+                    ])
+                elif output_format == "avi":
+                    ffmpeg_cmd.extend([
+                        '-c:v', 'mpeg4',
+                        '-c:a', 'mp3',
+                        '-q:v', '5'
+                    ])
+                elif output_format == "mov":
+                    ffmpeg_cmd.extend([
+                        '-c:v', 'libx264',
+                        '-c:a', 'aac',
+                        '-preset', 'medium'
+                    ])
+                
+                ffmpeg_cmd.extend(['-y', output_path])
+                
+                logger.info(f"Starting conversion with command: {' '.join(ffmpeg_cmd)}")
+                
+                # Start FFmpeg process
+                process = await asyncio.create_subprocess_exec(
+                    *ffmpeg_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                
+                # Read progress from stdout
+                while True:
+                    line = await process.stdout.readline()
+                    if not line:
+                        break
+                    
+                    line_str = line.decode().strip()
+                    
+                    # Parse progress information
+                    if line_str.startswith('out_time='):
+                        # Extract time progress
+                        time_str = line_str.split('=')[1]
+                        # Send progress update
+                        await websocket.send_json({
+                            "status": "converting",
+                            "message": "Converting video...",
+                            "progress": 50  # Estimate 50% for time-based progress
+                        })
+                    
+                    elif line_str.startswith('progress='):
+                        progress_val = line_str.split('=')[1]
+                        if progress_val == 'end':
+                            break
+                
+                # Wait for process completion
+                await process.wait()
+                
+                if process.returncode == 0:
+                    converted_size = os.path.getsize(output_path)
+                    video_info = get_video_info(output_path)
+                    
+                    await websocket.send_json({
+                        "status": "completed",
+                        "message": "Conversion completed successfully",
+                        "converted_filename": output_filename,
+                        "file_size": converted_size,
+                        "video_info": video_info,
+                        "download_url": f"http://localhost:8000/downloads/{output_filename}"
+                    })
+                else:
+                    stderr = await process.stderr.read()
+                    error_msg = stderr.decode() if stderr else "Unknown error"
+                    await websocket.send_json({
+                        "status": "error", 
+                        "message": f"Conversion failed: {error_msg}"
+                    })
+                    
+            except Exception as e:
+                logger.error(f"Conversion error: {e}")
+                await websocket.send_json({
+                    "status": "error", 
+                    "message": f"Conversion error: {str(e)}"
+                })
+        
+        # Start conversion
+        await convert_with_progress()
+        
+    except WebSocketDisconnect:
+        logger.info(f"WebSocket disconnected for conversion: {conversion_id}")
+    except Exception as e:
+        logger.error(f"WebSocket conversion error: {e}")
+        await websocket.send_json({
+            "status": "error", 
+            "message": f"WebSocket error: {str(e)}"
+        })
+    finally:
+        await websocket.close()
 
 if __name__ == "__main__":
     import uvicorn
