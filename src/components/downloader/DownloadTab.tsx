@@ -87,10 +87,59 @@ const DownloadTab = () => {
   // CONSTANTS
   // ============================================
   const formats = {
-    video: ["mp4", "webm", "avi", "mov"],
+    video: ["mp4", "mp3","webm", "avi", "mov"],
     audio: ["mp3", "m4a", "wav", "flac"]
   };
   const qualities = ["4K", "2K", "1080p", "720p", "480p", "360p", "240p", "144p"];
+
+  // ============================================
+  // HELPER FUNCTIONS
+  // ============================================
+  const getFileExtensionFromMimeType = (mimeType: string): string => {
+    const mimeMap: { [key: string]: string } = {
+      'video/mp4': 'mp4',
+      'audio/mpeg': 'mp3',
+      'audio/mp4': 'm4a',
+      'video/webm': 'webm',
+      'image/jpeg': 'jpg',
+      'image/png': 'png',
+      'application/zip': 'zip'
+    };
+    return mimeMap[mimeType] || '';
+  };
+
+  const validateUrl = (url: string): boolean => {
+    try {
+      const parsed = new URL(url);
+      const supportedDomains = [
+        'youtube.com', 'youtu.be',
+        'tiktok.com',
+        'instagram.com',
+        'facebook.com', 'fb.watch',
+        'twitter.com', 'x.com',
+        'reddit.com',
+        'vimeo.com',
+        'dailymotion.com'
+      ];
+      
+      return supportedDomains.some(domain => parsed.hostname.includes(domain));
+    } catch {
+      return false;
+    }
+  };
+
+  const checkServerConnection = async (): Promise<boolean> => {
+    try {
+      const response = await axios.get('http://127.0.0.1:8000/', { timeout: 5000 });
+      return response.status === 200;
+    } catch (error) {
+      return false;
+    }
+  };
+
+  const sanitizeFilename = (name: string) => {
+    return name.replace(/[^a-z0-9_\-\.]/gi, "_");
+  };
 
   // ============================================
   // FIX 1: LOAD INITIAL STATE ONLY ONCE
@@ -215,52 +264,91 @@ const DownloadTab = () => {
       const data = JSON.parse(event.data);
       console.log("WS DATA (reconnected):", data);
 
-      if (data.status === "downloading") {
-        const percentNum = typeof data.percent === "number" ? data.percent : parseFloat(data.percent);
-        setProgress(percentNum);
+      handleWebSocketMessage(data);
+    };
 
-        const fragInfo = data.fragment_count > 0 
-          ? ` (frag ${data.fragment_index}/${data.fragment_count})`
-          : "";
+    ws.onerror = (error) => {
+      console.error("WebSocket error:", error);
+      toast({
+        title: "Connection Error",
+        description: "Failed to connect to download server. Make sure the backend is running on port 8000.",
+        variant: "destructive"
+      });
+      resetDownloadState();
+    };
 
-        setStatusMessage(
-          `[download] ${percentNum.toFixed(1)}% of ~${data.total} at ${data.speed} ETA ${data.eta}${fragInfo}`
-        );
-      } 
-      else if (data.status === "processing") {
-        setProgress(95);
-        setStatusMessage(data.message);
-      } 
-      else if (data.status === "completed") {
-        setProgress(100);
-        setStatusMessage("Download Complete!");
-        setTimeout(() => downloadFile(data.filename), 500);
-      } 
-      else if (data.status === "cancelled") {
-        setStatusMessage("Download cancelled");
+    ws.onclose = (event) => {
+      console.log("WebSocket closed:", event.code, event.reason);
+      wsRef.current = null;
+      
+      // Only show message if it wasn't a normal closure
+      if (event.code !== 1000 && isDownloading) {
         toast({
-          title: "Download Cancelled",
-          description: "Download stopped by user"
-        });
-        resetDownloadState();
-      } 
-      else if (data.status === "error") {
-        toast({
-          title: "Download Failed",
-          description: data.message,
+          title: "Connection Lost",
+          description: "Download connection was interrupted",
           variant: "destructive"
         });
         resetDownloadState();
       }
     };
+  };
 
-    ws.onerror = (error) => {
-      console.error("WebSocket error:", error);
-    };
+  // ============================================
+  // WEB SOCKET MESSAGE HANDLER
+  // ============================================
+  const handleWebSocketMessage = (data: any) => {
+    if (data.status === "reconnected") {
+      setProgress(data.percent);
+      setStatusMessage(`Reconnected! ${data.message}`);
+    }
+    else if (data.status === "downloading") {
+      const percentNum = typeof data.percent === "number" ? data.percent : parseFloat(data.percent);
+      setProgress(percentNum);
 
-    ws.onclose = () => {
-      wsRef.current = null;
-    };
+      const fragInfo = data.fragment_count > 0 
+        ? ` (frag ${data.fragment_index}/${data.fragment_count})`
+        : "";
+
+      setStatusMessage(
+        `[download] ${percentNum.toFixed(1)}% of ~${data.total} at ${data.speed} ETA ${data.eta}${fragInfo}`
+      );
+    } 
+    else if (data.status === "processing") {
+      setProgress(95);
+      setStatusMessage(data.message);
+    } 
+    else if (data.status === "completed") {
+      setProgress(100);
+      setStatusMessage("Download Complete!");
+      
+      // ✅ FIX: Add proper file download with error handling
+      if (data.filename && data.file_url) {
+        setTimeout(() => downloadFile(data.filename, data.file_url), 500);
+      } else {
+        toast({
+          title: "Download Error",
+          description: "No filename received from server",
+          variant: "destructive"
+        });
+        resetDownloadState();
+      }
+    } 
+    else if (data.status === "cancelled") {
+      setStatusMessage("Download cancelled");
+      toast({
+        title: "Download Cancelled",
+        description: "Download stopped by user"
+      });
+      resetDownloadState();
+    } 
+    else if (data.status === "error") {
+      toast({
+        title: "Download Failed",
+        description: data.message,
+        variant: "destructive"
+      });
+      resetDownloadState();
+    }
   };
 
   // ============================================
@@ -335,6 +423,25 @@ const DownloadTab = () => {
       });
     }
 
+    // Validate URL
+    if (!validateUrl(url)) {
+      return toast({
+        title: "Invalid URL",
+        description: "Please enter a valid video URL from supported platforms",
+        variant: "destructive"
+      });
+    }
+
+    // Check server connection
+    const isServerRunning = await checkServerConnection();
+    if (!isServerRunning) {
+      return toast({
+        title: "Server Not Running",
+        description: "Please make sure the download server is running on port 8000",
+        variant: "destructive"
+      });
+    }
+
     const newDownloadId = `download_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     setDownloadId(newDownloadId);
     setIsDownloading(true);
@@ -356,100 +463,95 @@ const DownloadTab = () => {
     ws.onmessage = (event) => {
       const data = JSON.parse(event.data);
       console.log("WS DATA:", data);
-
-      if (data.status === "initializing") {
-        setStatusMessage(data.message);
-      } 
-      else if (data.status === "downloading") {
-        const percentNum = typeof data.percent === "number" ? data.percent : parseFloat(data.percent);
-        setProgress(percentNum);
-
-        const fragInfo = data.fragment_count > 0 
-          ? ` (frag ${data.fragment_index}/${data.fragment_count})`
-          : "";
-
-        setStatusMessage(
-          `[download] ${percentNum.toFixed(1)}% of ~${data.total} at ${data.speed} ETA ${data.eta}${fragInfo}`
-        );
-      } 
-      else if (data.status === "processing") {
-        setProgress(95);
-        setStatusMessage(data.message);
-      } 
-      else if (data.status === "completed") {
-        setProgress(100);
-        setStatusMessage("Download Complete!");
-        setTimeout(() => downloadFile(data.filename), 500);
-      } 
-      else if (data.status === "cancelled") {
-        setStatusMessage("Download cancelled");
-        toast({
-          title: "Download Cancelled",
-          description: "Download stopped by user"
-        });
-        resetDownloadState();
-      } 
-      else if (data.status === "error") {
-        toast({
-          title: "Download Failed",
-          description: data.message,
-          variant: "destructive"
-        });
-        resetDownloadState();
-      }
+      handleWebSocketMessage(data);
     };
 
-    ws.onerror = () => {
+    ws.onerror = (error) => {
+      console.error("WebSocket error:", error);
       toast({
         title: "Connection Error",
-        description: "Failed to connect to download server",
+        description: "Failed to connect to download server. Make sure the backend is running on port 8000.",
         variant: "destructive"
       });
       resetDownloadState();
     };
 
-    ws.onclose = () => {
+    ws.onclose = (event) => {
+      console.log("WebSocket closed:", event.code, event.reason);
       wsRef.current = null;
+      
+      // Only show message if it wasn't a normal closure
+      if (event.code !== 1000 && isDownloading) {
+        toast({
+          title: "Connection Lost",
+          description: "Download connection was interrupted",
+          variant: "destructive"
+        });
+        resetDownloadState();
+      }
     };
   };
 
   // ============================================
   // DOWNLOAD FILE FROM SERVER
   // ============================================
-  const sanitizeFilename = (name: string) => {
-    return name.replace(/[^a-z0-9_\-\.]/gi, "_");
-  };
-
-  const downloadFile = async (filename: string) => {
+  const downloadFile = async (filename: string, fileUrl?: string) => {
     try {
-      setStatusMessage("Saving file...");
+      setStatusMessage("Preparing download...");
       
-      const response = await axios.get(
-        `http://127.0.0.1:8000/downloads/${encodeURIComponent(filename)}`,
-        { responseType: 'blob' }
-      );
+      // Use provided file URL or construct it
+      const downloadUrl = fileUrl || `http://127.0.0.1:8000/downloads/${encodeURIComponent(filename)}`;
+      
+      const response = await axios.get(downloadUrl, {
+        responseType: 'blob',
+        timeout: 30000,
+        onDownloadProgress: (progressEvent) => {
+          if (progressEvent.total) {
+            const percent = (progressEvent.loaded / progressEvent.total) * 100;
+            setStatusMessage(`Saving file... ${percent.toFixed(1)}%`);
+          }
+        }
+      });
+
+      // Check if we got a valid blob
+      if (!response.data || response.data.size === 0) {
+        throw new Error("Empty file received");
+      }
 
       const blob = new Blob([response.data]);
-      const downloadUrl = window.URL.createObjectURL(blob);
+      
+      // Detect file type and set proper extension
+      let finalFilename = sanitizeFilename(filename);
+      const contentType = response.headers['content-type'];
+      
+      if (contentType) {
+        const ext = getFileExtensionFromMimeType(contentType);
+        if (ext && !finalFilename.toLowerCase().endsWith(ext.toLowerCase())) {
+          finalFilename += `.${ext}`;
+        }
+      }
+
+      const downloadUrlObject = window.URL.createObjectURL(blob);
       const a = document.createElement("a");
-      a.href = downloadUrl;
-      a.download = sanitizeFilename(filename);
+      a.href = downloadUrlObject;
+      a.download = finalFilename;
       document.body.appendChild(a);
       a.click();
-      a.remove();
-      window.URL.revokeObjectURL(downloadUrl);
+      document.body.removeChild(a);
+      window.URL.revokeObjectURL(downloadUrlObject);
 
       saveToHistory(filename);
       toast({
         title: "Download Complete",
-        description: `Downloaded ${filename} successfully`
+        description: `Downloaded ${finalFilename} successfully`
       });
 
       setTimeout(resetDownloadState, 2000);
-    } catch (err) {
+    } catch (err: any) {
+      console.error("Download file error:", err);
       toast({
         title: "Download Failed",
-        description: "Failed to save file to device",
+        description: err.response?.data?.detail || err.message || "Failed to save file to device",
         variant: "destructive"
       });
       resetDownloadState();
@@ -525,10 +627,6 @@ const DownloadTab = () => {
   };
 
   // ============================================
-  // REMOVED: Settings sync effect that was overwriting selections
-  // ============================================
-
-  // ============================================
   // RENDER
   // ============================================
   return (
@@ -594,16 +692,20 @@ const DownloadTab = () => {
         </div>
         <div>
           <Label>Quality</Label>
-          <Select value={quality} onValueChange={setQuality} disabled={isDownloading}>
+          <Select value={quality} onValueChange={setQuality} disabled={isDownloading || downloadType === "audio"}>
             <SelectTrigger>
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              {qualities.map((q) => (
-                <SelectItem key={q} value={q}>
-                  {q}
-                </SelectItem>
-              ))}
+              {downloadType === "audio" ? (
+                <SelectItem value="best">Best Quality</SelectItem>
+              ) : (
+                qualities.map((q) => (
+                  <SelectItem key={q} value={q}>
+                    {q}
+                  </SelectItem>
+                ))
+              )}
             </SelectContent>
           </Select>
         </div>

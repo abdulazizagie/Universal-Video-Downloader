@@ -109,6 +109,13 @@ def load_settings():
             return {}
     return {}
 
+def save_settings():
+    try:
+        with open(SETTINGS_FILE, "w") as f:
+            json.dump(user_settings, f, indent=2)
+    except Exception as e:
+        logger.error(f"Failed to save settings: {e}")
+
 def save_history_entry(entry: dict):
     try:
         history = []
@@ -172,8 +179,31 @@ def get_platform_opts(platform: str) -> Dict[str, Any]:
             }
         }
     elif platform == 'instagram':
+        opts.update({
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (Linux; Android 10; SM-G975F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Mobile Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+                'Accept-Encoding': 'gzip, deflate',
+                'DNT': '1',
+                'Connection': 'keep-alive',
+                'Upgrade-Insecure-Requests': '1',
+            },
+        })
+    elif platform == 'facebook':
         opts['http_headers'] = {
-            'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Referer': 'https://www.facebook.com/'
+        }
+    elif platform == 'twitter':
+        opts['http_headers'] = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36',
+            'Referer': 'https://twitter.com/'
+        }
+    elif platform == 'vimeo':
+        opts['http_headers'] = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Referer': 'https://vimeo.com/'
         }
     
     return opts
@@ -211,14 +241,34 @@ def extract_format_info(fmt: Dict) -> Dict[str, Any]:
         'quality_score': quality_score,
     }
 
-def find_best_format(formats: List[Dict], requested_height: int, format_type: str = 'video') -> Optional[Dict]:
+def find_best_format(formats: List[Dict], requested_height: int, format_type: str = 'video', platform: str = 'unknown') -> Optional[Dict]:
     if not formats:
         return None
     
+    # ✅ FIX: Filter out HEVC/h265 formats for TikTok to avoid codec issues
+    filtered_formats = formats.copy()
+    if platform == 'tiktok':
+        filtered_formats = [fmt for fmt in formats if 'hevc' not in (fmt.get('vcodec') or '').lower() and 'h265' not in (fmt.get('vcodec') or '').lower()]
+        if not filtered_formats:
+            filtered_formats = formats  # Fallback to all formats if no non-HEVC found
+        logger.info(f"🔧 Filtered out HEVC formats for TikTok. Remaining: {len(filtered_formats)} formats")
+    
     if format_type == 'video':
-        candidates = [fmt for fmt in formats if fmt.get('vcodec') != 'none' and fmt.get('vcodec') is not None]
-    else:
-        candidates = [fmt for fmt in formats if fmt.get('acodec') != 'none' and fmt.get('acodec') is not None]
+        # For video: prioritize formats with both video+audio, fallback to video-only
+        combined_formats = [fmt for fmt in filtered_formats 
+                          if fmt.get('vcodec') != 'none' and fmt.get('acodec') != 'none'
+                          and fmt.get('vcodec') is not None]
+        
+        video_only_formats = [fmt for fmt in filtered_formats 
+                            if fmt.get('vcodec') != 'none' and fmt.get('acodec') == 'none'
+                            and fmt.get('vcodec') is not None]
+        
+        # Prefer combined formats, but include video-only as fallback
+        candidates = combined_formats if combined_formats else video_only_formats
+        
+    else:  # audio
+        candidates = [fmt for fmt in filtered_formats 
+                     if fmt.get('acodec') != 'none' and fmt.get('acodec') is not None]
     
     if not candidates:
         return None
@@ -226,7 +276,6 @@ def find_best_format(formats: List[Dict], requested_height: int, format_type: st
     processed = [extract_format_info(fmt) for fmt in candidates]
     
     if format_type == 'video':
-        # Include formats without height (common in non-YouTube platforms)
         valid = [f for f in processed if f['height'] is not None or f['tbr'] is not None]
         if not valid:
             return candidates[0]
@@ -238,13 +287,12 @@ def find_best_format(formats: List[Dict], requested_height: int, format_type: st
             best = exact_matches[0]
             logger.info(f"🎯 Exact quality match found: {best['height']}p")
         else:
-            # Sort by height (or tbr if height is missing) and find closest
             valid.sort(key=lambda x: (
                 abs(x['height'] - requested_height) if x['height'] is not None else float('inf'),
                 x.get('tbr', 0)
             ))
             best = valid[0]
-            logger.info(f"🔄 Closest quality: {best['height'] or 'N/A'}p (requested: {requested_height}p, tbr: {best['tbr']})")
+            logger.info(f"🔄 Closest quality: {best['height'] or 'N/A'}p (requested: {requested_height}p)")
         
     else:
         valid = [f for f in processed if f['tbr'] is not None]
@@ -255,7 +303,9 @@ def find_best_format(formats: List[Dict], requested_height: int, format_type: st
     
     for fmt in candidates:
         if fmt.get('format_id') == best['format_id']:
-            logger.info(f"✅ Selected format: {best['format_id']} - {best.get('height', 'N/A')}p - {best.get('tbr', 'N/A')}kbps")
+            vcodec = fmt.get('vcodec', 'N/A')
+            has_audio = fmt.get('acodec') != 'none'
+            logger.info(f"✅ Selected format: {best['format_id']} - {best.get('height', 'N/A')}p - {vcodec} - Has Audio: {has_audio}")
             return fmt
     
     return candidates[0]
@@ -342,6 +392,12 @@ async def get_video_info(req: VideoRequest):
         opts.update(get_platform_opts(platform))
         opts['noplaylist'] = True
         
+        # ✅ FIX: Special handling for Instagram and Twitter
+        if platform == 'instagram':
+            opts['format'] = 'bestvideo+bestaudio/best'
+        elif platform == 'twitter':
+            opts['format'] = 'bestvideo+bestaudio/best'
+        
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(req.url, download=False)
         
@@ -372,7 +428,7 @@ async def get_video_info(req: VideoRequest):
         raise HTTPException(status_code=500, detail=f"Failed to get video info: {str(e)}")
 
 # ============================================
-# Step 5: FIXED WebSocket Download System with Tab Switch Support
+# Step 5: FIXED WebSocket Download System with TikTok & Twitter Support
 # ============================================
 @app.websocket("/ws/download/{download_id}")
 async def websocket_download(websocket: WebSocket, download_id: str):
@@ -446,6 +502,20 @@ async def websocket_download(websocket: WebSocket, download_id: str):
         ydl_opts.update(get_platform_opts(platform))
         ydl_opts['noplaylist'] = True
 
+        # ✅ FIX: Enhanced platform-specific configuration
+        if platform == 'instagram':
+            ydl_opts.update({
+                'format': 'bestvideo+bestaudio/best',
+                'merge_output_format': 'mp4',
+            })
+            logger.info("🔧 Applied Instagram-specific download settings")
+        elif platform == 'twitter':
+            ydl_opts.update({
+                'format': 'bestvideo+bestaudio/best',
+                'merge_output_format': 'mp4',
+            })
+            logger.info("🔧 Applied Twitter-specific download settings")
+
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
 
@@ -465,19 +535,83 @@ async def websocket_download(websocket: WebSocket, download_id: str):
             }]
             final_ext = audio_format
             logger.info(f"🎵 Audio download: format={audio_format}")
-            
+
         elif format_type == "video":
-            # Select the best format based on requested height
-            best_format = find_best_format(info.get('formats', []), requested_height, format_type)
-            if not best_format:
-                raise ValueError("No suitable video format found")
-            format_id = best_format.get('format_id')
-            ydl_opts['outtmpl'] = os.path.join(DOWNLOADS_DIR, f"{base_filename}_{quality}.%(ext)s")
-            ydl_opts['format'] = format_id
-            ydl_opts['merge_output_format'] = 'mp4'
-            final_ext = 'mp4'
-            logger.info(f"🎥 Video download: {quality} -> format_id={format_id}")
+            # Get all available formats
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
             
+            # ✅ FIX: Special handling for different platforms
+            if platform in ['instagram', 'twitter']:
+                # Instagram & Twitter: Use combined format approach
+                ydl_opts['outtmpl'] = os.path.join(DOWNLOADS_DIR, f"{base_filename}_{quality}.%(ext)s")
+                ydl_opts['format'] = 'bestvideo+bestaudio/best'
+                ydl_opts['merge_output_format'] = 'mp4'
+                final_ext = 'mp4'
+                logger.info(f"🎥 {platform.capitalize()} video download: Using bestvideo+bestaudio format")
+            elif platform == 'tiktok':
+                # ✅ FIX: TikTok - Avoid HEVC codec and ensure audio merging
+                ydl_opts['outtmpl'] = os.path.join(DOWNLOADS_DIR, f"{base_filename}_{quality}.%(ext)s")
+                
+                # Find best non-HEVC format
+                best_format = find_best_format(info.get('formats', []), requested_height, format_type, platform)
+                
+                if not best_format:
+                    raise ValueError("No suitable video format found")
+                
+                format_id = best_format.get('format_id')
+                
+                # Check if selected format has audio
+                has_audio = best_format.get('acodec') != 'none'
+                
+                if not has_audio:
+                    logger.warning("⚠️ Selected TikTok video format has no audio, will attempt to merge with best audio stream")
+                    
+                    # Find best audio format
+                    audio_format_obj = find_best_format(info.get('formats', []), 0, 'audio', platform)
+                    if audio_format_obj:
+                        audio_format_id = audio_format_obj.get('format_id')
+                        # Use format combination: video+audio
+                        format_id = f"{format_id}+{audio_format_id}"
+                        logger.info(f"🔊 Will merge TikTok video {format_id} with audio {audio_format_id}")
+                    else:
+                        logger.warning("⚠️ No audio stream found for TikTok - video will be silent")
+                
+                ydl_opts['format'] = format_id
+                ydl_opts['merge_output_format'] = 'mp4'
+                final_ext = 'mp4'
+                logger.info(f"🎥 TikTok video download: {quality} -> format_id={format_id} (has_audio: {has_audio})")
+            else:
+                # Other platforms: Standard approach
+                best_format = find_best_format(info.get('formats', []), requested_height, format_type, platform)
+                
+                if not best_format:
+                    raise ValueError("No suitable video format found")
+                
+                format_id = best_format.get('format_id')
+                
+                # Check if selected format has audio
+                has_audio = best_format.get('acodec') != 'none'
+                
+                if not has_audio:
+                    logger.warning("⚠️ Selected video format has no audio, will attempt to merge with best audio stream")
+                    
+                    # Find best audio format
+                    audio_format_obj = find_best_format(info.get('formats', []), 0, 'audio', platform)
+                    if audio_format_obj:
+                        audio_format_id = audio_format_obj.get('format_id')
+                        # Use format combination: video+audio
+                        format_id = f"{format_id}+{audio_format_id}"
+                        logger.info(f"🔊 Will merge video {format_id} with audio {audio_format_id}")
+                    else:
+                        logger.warning("⚠️ No audio stream found - video will be silent")
+                
+                ydl_opts['outtmpl'] = os.path.join(DOWNLOADS_DIR, f"{base_filename}_{quality}.%(ext)s")
+                ydl_opts['format'] = format_id
+                ydl_opts['merge_output_format'] = 'mp4'
+                final_ext = 'mp4'
+                logger.info(f"🎥 Video download: {quality} -> format_id={format_id} (has_audio: {has_audio})")           
+
         else:  # thumbnail
             ydl_opts['outtmpl'] = os.path.join(DOWNLOADS_DIR, f"{base_filename}_thumbnail.%(ext)s")
             ydl_opts['writethumbnail'] = True
@@ -567,16 +701,19 @@ async def websocket_download(websocket: WebSocket, download_id: str):
                     FFMPEG_PATH.replace('ffmpeg', 'ffprobe'),
                     '-v', 'error',
                     '-select_streams', 'v:0',
-                    '-show_entries', 'stream=height',
+                    '-show_entries', 'stream=height,codec_name',
                     '-of', 'csv=p=0',
                     downloaded_file
                 ]
                 result = subprocess.run(ffprobe_cmd, capture_output=True, text=True)
                 if result.returncode == 0:
-                    actual_height = int(result.stdout.strip())
-                    quality_map = {144: "144p", 240: "240p", 360: "360p", 480: "480p", 720: "720p", 1080: "1080p", 1440: "2K", 2160: "4K", 4320: "8K"}
-                    actual_quality = quality_map.get(actual_height, f"{actual_height}p")
-                    logger.info(f"📊 Actual quality: {actual_quality} ({actual_height}p)")
+                    lines = result.stdout.strip().split('\n')
+                    if lines:
+                        actual_height = int(lines[0].split(',')[0])
+                        codec_name = lines[0].split(',')[1] if len(lines[0].split(',')) > 1 else 'unknown'
+                        quality_map = {144: "144p", 240: "240p", 360: "360p", 480: "480p", 720: "720p", 1080: "1080p", 1440: "2K", 2160: "4K", 4320: "8K"}
+                        actual_quality = quality_map.get(actual_height, f"{actual_height}p")
+                        logger.info(f"📊 Actual quality: {actual_quality} ({actual_height}p) - Codec: {codec_name}")
             except Exception as e:
                 logger.warning(f"Could not verify video quality: {e}")
 
@@ -679,6 +816,14 @@ async def download_video(req: DownloadRequest, background_tasks: BackgroundTasks
         ydl_opts.update(get_platform_opts(platform))
         ydl_opts['noplaylist'] = not req.playlist
         
+        # ✅ FIX: Platform-specific configuration
+        if platform == 'instagram':
+            ydl_opts['format'] = 'bestvideo+bestaudio/best'
+            ydl_opts['merge_output_format'] = 'mp4'
+        elif platform == 'twitter':
+            ydl_opts['format'] = 'bestvideo+bestaudio/best'
+            ydl_opts['merge_output_format'] = 'mp4'
+        
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(req.url, download=False)
         
@@ -708,18 +853,69 @@ async def download_video(req: DownloadRequest, background_tasks: BackgroundTasks
             })
             
         elif req.type == "video":
-            # Select the best format based on requested height
-            best_format = find_best_format(info.get('formats', []), requested_height, req.type)
-            if not best_format:
-                raise ValueError("No suitable video format found")
-            format_id = best_format.get('format_id')
-            filename = clean_filename(f"{info['title']}_{req.quality}.mp4")
-            full_path = os.path.join(DOWNLOADS_DIR, filename)
-            ydl_opts.update({
-                'outtmpl': full_path.replace('.mp4', '.%(ext)s'),
-                'format': format_id,
-                'merge_output_format': 'mp4',
-            })
+            # ✅ FIX: Special handling for different platforms
+            if platform in ['instagram', 'twitter']:
+                filename = clean_filename(f"{info['title']}_{req.quality}.mp4")
+                full_path = os.path.join(DOWNLOADS_DIR, filename)
+                ydl_opts.update({
+                    'outtmpl': full_path.replace('.mp4', '.%(ext)s'),
+                    'format': 'bestvideo+bestaudio/best',
+                    'merge_output_format': 'mp4',
+                })
+            elif platform == 'tiktok':
+                # ✅ FIX: TikTok - Avoid HEVC and ensure audio
+                filename = clean_filename(f"{info['title']}_{req.quality}.mp4")
+                full_path = os.path.join(DOWNLOADS_DIR, filename)
+                
+                # Find best non-HEVC format
+                best_format = find_best_format(info.get('formats', []), requested_height, req.type, platform)
+                
+                if not best_format:
+                    raise ValueError("No suitable video format found")
+                
+                format_id = best_format.get('format_id')
+                
+                # Check if selected format has audio
+                has_audio = best_format.get('acodec') != 'none'
+                
+                if not has_audio:
+                    # Find best audio format
+                    audio_format_obj = find_best_format(info.get('formats', []), 0, 'audio', platform)
+                    if audio_format_obj:
+                        audio_format_id = audio_format_obj.get('format_id')
+                        format_id = f"{format_id}+{audio_format_id}"
+                
+                ydl_opts.update({
+                    'outtmpl': full_path.replace('.mp4', '.%(ext)s'),
+                    'format': format_id,
+                    'merge_output_format': 'mp4',
+                })
+            else:
+                # Standard approach for other platforms
+                best_format = find_best_format(info.get('formats', []), requested_height, req.type, platform)
+                
+                if not best_format:
+                    raise ValueError("No suitable video format found")
+                
+                format_id = best_format.get('format_id')
+                
+                # Check if selected format has audio
+                has_audio = best_format.get('acodec') != 'none'
+                
+                if not has_audio:
+                    # Find best audio format
+                    audio_format_obj = find_best_format(info.get('formats', []), 0, 'audio', platform)
+                    if audio_format_obj:
+                        audio_format_id = audio_format_obj.get('format_id')
+                        format_id = f"{format_id}+{audio_format_id}"
+                
+                filename = clean_filename(f"{info['title']}_{req.quality}.mp4")
+                full_path = os.path.join(DOWNLOADS_DIR, filename)
+                ydl_opts.update({
+                    'outtmpl': full_path.replace('.mp4', '.%(ext)s'),
+                    'format': format_id,
+                    'merge_output_format': 'mp4',
+                })
             
         else:  # thumbnail
             filename = clean_filename(f"{info['title']}.jpg")
@@ -809,18 +1005,30 @@ async def handle_playlist_download(req: DownloadRequest, info: Dict, ydl_opts: D
         })
     else:
         requested_height = parse_quality_request(req.quality)
-        # Select best format for each video in the playlist
+        # Select best format for each video in the playlist with audio merging
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(req.url, download=False)
             format_ids = []
             for entry in info.get('entries', []):
-                best_format = find_best_format(entry.get('formats', []), requested_height, req.type)
+                best_format = find_best_format(entry.get('formats', []), requested_height, req.type, detect_platform(req.url))
                 if best_format:
-                    format_ids.append(best_format.get('format_id'))
+                    format_id = best_format.get('format_id')
+                    # Check if format has audio
+                    has_audio = best_format.get('acodec') != 'none'
+                    
+                    if not has_audio:
+                        # Find best audio format for this entry
+                        audio_format = find_best_format(entry.get('formats', []), 0, 'audio', detect_platform(req.url))
+                        if audio_format:
+                            audio_format_id = audio_format.get('format_id')
+                            format_id = f"{format_id}+{audio_format_id}"
+                    
+                    format_ids.append(format_id)
                 else:
-                    format_ids.append('best[height<={requested_height}]/best')
+                    format_ids.append('bestvideo[height<={requested_height}]+bestaudio/best')
+        
         ydl_opts.update({
-            'format': '+'.join(format_ids) if format_ids else f'best[height<={requested_height}]/best',
+            'format': '+'.join(format_ids) if format_ids else 'bestvideo+bestaudio/best',
             'merge_output_format': 'mp4',
         })
     
@@ -939,6 +1147,39 @@ async def root():
         "cookies": "✓ Loaded" if os.path.exists(COOKIES_FILE) else "Not loaded",
         "supported_platforms": ["YouTube", "TikTok", "Twitter/X", "Instagram", "Facebook", "Reddit", "Vimeo", "Dailymotion"]
     }
+
+@app.post("/api/debug-formats")
+async def debug_formats(req: VideoRequest):
+    try:
+        platform = detect_platform(req.url)
+        opts = BASE_YDL_OPTS.copy()
+        opts.update(get_platform_opts(platform))
+        
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(req.url, download=False)
+        
+        format_details = []
+        for fmt in info.get('formats', []):
+            format_details.append({
+                'format_id': fmt.get('format_id'),
+                'ext': fmt.get('ext'),
+                'resolution': fmt.get('resolution'),
+                'vcodec': fmt.get('vcodec'),
+                'acodec': fmt.get('acodec'),
+                'filesize': fmt.get('filesize'),
+                'note': fmt.get('format_note'),
+                'has_audio': fmt.get('acodec') != 'none',
+                'has_video': fmt.get('vcodec') != 'none',
+            })
+        
+        return {
+            "platform": platform,
+            "title": info.get('title'),
+            "formats": format_details
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn
